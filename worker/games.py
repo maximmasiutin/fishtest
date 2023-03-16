@@ -543,7 +543,7 @@ def find_arch(compiler):
             arch = "apple-silicon"
         elif (
             "armv8" in props["arch"]
-            "dotprod" in props["arch"]
+            and "dotprod" in props["arch"]
         ):
             arch = "armv8-dotprod"
         elif (
