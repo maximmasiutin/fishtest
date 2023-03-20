@@ -544,6 +544,7 @@ def find_arch(compiler):
         elif (
             "armv8" in props["arch"]
             and "dotprod" in props["arch"]
+            and not ("nodotprod" in props["arch"])
         ):
             arch = "armv8-dotprod"
         elif (
