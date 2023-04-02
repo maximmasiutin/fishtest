@@ -542,6 +542,29 @@ def find_arch(compiler):
         ):
             arch = "apple-silicon"
         elif (
+            "armv8" in props["arch"]
+            and "dotprod" in props["arch"]
+            and not ("nodotprod" in props["arch"])
+        ):
+            arch = "armv8-dotprod"
+        elif (
+            "armv8" in props["arch"]
+        ):
+            arch = "armv8"
+        elif (
+            "armv7" in props["arch"]
+        ):
+            arch = "armv7"
+        elif (
+            "avx512vnni" in props["flags"]
+            and "avx512dq" in props["flags"]
+            and "avx512f" in props["flags"]
+            and "avx512bw" in props["flags"]
+            and "avx512vl" in props["flags"]
+            and "x86-64-vnni512" in targets
+        ):
+            arch = "x86-64-vnni512"
+        elif (            
             "avx512vnni" in props["flags"]
             and "avx512dq" in props["flags"]
             and "avx512f" in props["flags"]
@@ -556,7 +579,6 @@ def find_arch(compiler):
             and "x86-64-avx512" in targets
         ):
             arch = "x86-64-avx512"
-            arch = "x86-64-bmi2"  # use bmi2 until avx512 performance becomes actually better
         elif "avxvnni" in props["flags"] and "x86-64-avxvnni" in targets:
             arch = "x86-64-avxvnni"
         elif (
@@ -1011,7 +1033,7 @@ def launch_cutechess(
         + cmd[idx + 1 :]
     )
 
-    #    print(cmd)
+    print(cmd)
     try:
         with subprocess.Popen(
             cmd,
@@ -1392,7 +1414,7 @@ def run_games(worker_info, password, remote, run, task_id, pgn_file):
                 "-engine",
                 "name=New-" + run["args"]["resolved_new"][:10],
                 "tc={}".format(scaled_new_tc),
-                "cmd={}".format(new_engine_name),
+                "cmd=./{}".format(new_engine_name),
                 "dir=.",
             ]
             + new_options
@@ -1401,7 +1423,7 @@ def run_games(worker_info, password, remote, run, task_id, pgn_file):
                 "-engine",
                 "name=Base-" + run["args"]["resolved_base"][:10],
                 "tc={}".format(scaled_tc),
-                "cmd={}".format(base_engine_name),
+                "cmd=./{}".format(base_engine_name),
                 "dir=.",
             ]
             + base_options
