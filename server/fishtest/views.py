@@ -672,7 +672,7 @@ def user(request):
                 + " user "
                 + user_name
             )
-            request.userdb.blocked.clear()
+            request.userdb.clear_cache()
             request.userdb.save_user(user_data)
             request.actiondb.block_user(
                 username=userid,
@@ -681,7 +681,7 @@ def user(request):
             )
 
         elif "pending" in request.POST and user_data["pending"]:
-            request.userdb.pending.clear()
+            request.userdb.clear_cache()
             if request.POST["pending"] == "0":
                 user_data["pending"] = False
                 request.userdb.save_user(user_data)
@@ -974,9 +974,13 @@ def validate_form(request):
     if checkbox_arch_filter == "off":
         data["arch_filter"] = ""
 
+    if data["arch_filter"] == "":
+        del data["arch_filter"]
+
     # check if arch filter is a valid regular expression
     try:
-        regex.compile(data["arch_filter"])
+        if "arch_filter" in data:
+            regex.compile(data["arch_filter"])
     except regex.error as e:
         raise Exception(f"Invalid arch filter: {e}") from e
 
@@ -1032,8 +1036,8 @@ def validate_form(request):
         data["base_signature"] = data["new_signature"]
 
     for k, v in data.items():
-        if len(v) == 0 and k != "arch_filter":
-            raise Exception("Missing required option: {}".format(k))
+        if len(v) == 0:
+            raise Exception(f"Missing required option: {k}")
 
     # Handle boolean options
     data["auto_purge"] = request.POST.get("auto-purge") is not None
