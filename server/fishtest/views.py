@@ -33,6 +33,8 @@ from fishtest.util import (
     password_strength,
     plural,
     reasonable_run_hashes,
+    supported_arches,
+    supported_compilers,
     tests_repo,
 )
 from pyramid.httpexceptions import HTTPFound, HTTPNotFound
@@ -916,6 +918,7 @@ def validate_form(request):
         "tests_repo": request.POST["tests-repo"],
         "info": request.POST["run-info"],
         "arch_filter": request.POST["arch-filter"],
+        "compiler": request.POST["compiler"],
     }
     try:
         # Deal with people that have changed their GitHub username
@@ -968,6 +971,12 @@ def validate_form(request):
     if odds == "off":
         data["new_tc"] = data["tc"]
 
+    checkbox_compiler = request.POST.get(
+        "checkbox-compiler", "off"
+    )  # off checkboxes are not posted
+    if checkbox_compiler == "off":
+        del data["compiler"]
+
     checkbox_arch_filter = request.POST.get(
         "checkbox-arch-filter", "off"
     )  # off checkboxes are not posted
@@ -983,6 +992,14 @@ def validate_form(request):
             regex.compile(data["arch_filter"])
     except regex.error as e:
         raise Exception(f"Invalid arch filter: {e}") from e
+
+    # check if there are any remaining arches
+    if "arch_filter" in data:
+        filtered_arches = filter(
+            lambda x: regex.search(data["arch_filter"], x) is not None, supported_arches
+        )
+        if list(filtered_arches) == []:
+            raise Exception(f"filter {data['arch_filter']} has no compatible arches")
 
     validate(tc_schema, data["tc"], "data['tc']")
     validate(tc_schema, data["new_tc"], "data['new_tc']")
@@ -1279,6 +1296,8 @@ def tests_run(request):
         "master_info": get_master_info(ignore_rate_limit=True),
         "valid_books": request.rundb.books.keys(),
         "pt_info": request.rundb.pt_info,
+        "supported_arches": supported_arches,
+        "supported_compilers": supported_compilers,
     }
 
 
@@ -1579,6 +1598,7 @@ def tests_view(request):
         "master_repo",
         "adjudication",
         "arch_filter",
+        "compiler",
         "info",
     ):
         if name not in run["args"]:
@@ -1586,6 +1606,17 @@ def tests_view(request):
 
         value = run["args"][name]
         url = ""
+
+        if name == "arch_filter":
+            if value != "":
+                filtered_arches = list(
+                    filter(
+                        lambda x: regex.search(value, x) is not None, supported_arches
+                    )
+                )
+                value += "  (" + ", ".join(filtered_arches) + ")"
+            else:
+                continue
 
         if name == "new_tag" and "msg_new" in run["args"]:
             value += "  (" + run["args"]["msg_new"][:50] + ")"
@@ -1715,6 +1746,8 @@ def tests_view(request):
         warnings.append("this is a test with time odds")
     if run["args"].get("arch_filter", "") != "":
         warnings.append("this test has a non-trivial arch filter")
+    if run["args"].get("compiler", "") != "":
+        warnings.append("this test has a pinned compiler")
     book_exits = request.rundb.books.get(run["args"]["book"], {}).get("total", 100000)
     if book_exits < 100000:
         warnings.append(f"this test uses a small book with only {book_exits} exits")

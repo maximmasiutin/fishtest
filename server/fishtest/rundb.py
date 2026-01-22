@@ -561,6 +561,7 @@ class RunDb:
         priority=0,
         adjudication=True,
         arch_filter=None,
+        compiler=None,
     ):
         if start_time is None:
             start_time = datetime.now(UTC)
@@ -599,6 +600,9 @@ class RunDb:
 
         if arch_filter is not None:
             run_args["arch_filter"] = arch_filter
+
+        if compiler is not None:
+            run_args["compiler"] = compiler
 
         if sprt is not None:
             run_args["sprt"] = sprt
@@ -1103,21 +1107,28 @@ After fixing the issues you can unblock the worker at
         max_memory = int(worker_info.get("max_memory", 0))
         near_github_api_limit = worker_info["near_github_api_limit"]
         worker_arch = worker_info["worker_arch"]
+        worker_compiler = worker_info["compiler"]
 
         # Now we sort the list of unfinished runs according to priority.
         last_run_id = self.worker_runs.get(my_name, {}).get("last_run", None)
 
-        def priority(run):  # lower is better
+        def priority(run):
+            # We re-add the number of cores that were freed by this worker when the previous
+            # task on this run finished. If we don't do this then this worker is likely to pick
+            # up this run again, especially if it has many cores.
+            adjusted_cores = run["cores"] + (
+                max_threads if str(run["_id"]) == last_run_id else 0
+            )
+
+            # lower is better
             return (
                 # Always consider the higher priority runs first
                 -run["args"]["priority"],
-                # Try to avoid repeatedly working on the same test
-                str(run["_id"]) == last_run_id,
                 # Make sure all runs at this priority level get _some_ cores
-                run["cores"] > 0,
+                adjusted_cores > 0,
                 # Try to match run["args"]["itp"].
-                # Add max_threads/2 to mitigate granularity issues with large core workers.
-                (run["cores"] + max_threads / 2) / run["args"]["itp"],
+                # The added term max_threads/2 is to mitigate granularity issues with large core workers.
+                (adjusted_cores + max_threads / 2) / run["args"]["itp"],
             )
 
         # Use a local copy of (the sorted) unfinished runs list so that it does
@@ -1194,7 +1205,7 @@ After fixing the issues you can unblock the worker at
             if run["cores"] > limit_cores:
                 continue
 
-            # check if we satisfy the filter
+            # check if we satisfy the arch filter
             arch_filter = run["args"].get("arch_filter", "")
             if arch_filter != "":
                 arch_filter_re = self.compile_regex(arch_filter)
@@ -1217,6 +1228,11 @@ After fixing the issues you can unblock the worker at
                         message,
                         flush=True,
                     )
+
+            # check if we have the correct compiler
+            compiler = run["args"].get("compiler", "")
+            if compiler != "" and compiler != worker_compiler:
+                continue
 
             # If we make it here, it means we have found a run
             # suitable for a new task.
