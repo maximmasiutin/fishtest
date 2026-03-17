@@ -8,8 +8,8 @@
   const runId = {{ run_id | tojson }};
 </script>
 <script
-  src="https://cdnjs.cloudflare.com/ajax/libs/jsdiff/8.0.2/diff.min.js"
-  integrity="sha512-8pp155siHVmN5FYcqWNSFYn8Efr61/7mfg/F15auw8MCL3kvINbNT7gT8LldYPq3i/GkSADZd4IcUXPBoPP8gA=="
+  src="https://cdn.jsdelivr.net/npm/diff@8.0.3/dist/diff.min.js"
+  integrity="sha256-g/bQGN3C0H+2VSdJbQs3iUM/y+M5E+qqBok29ZjwTWQ="
   crossorigin="anonymous"
   referrerpolicy="no-referrer"
 ></script>
@@ -18,11 +18,27 @@
   <script>
     document.documentElement.style="scroll-behavior:auto; overflow:hidden;";
     function scroll_to(task_id) {
-      const task_offset = document.getElementById("task" + task_id).offsetTop;
-      const tasks_head_height = document.getElementById("tasks-head").offsetHeight;
-      const tasks_div = document.getElementById("tasks");
-      tasks_div.scrollIntoView();
-      tasks_div.scrollTop = task_offset - tasks_head_height;
+      const task_row = document.getElementById("task" + task_id);
+      const tasks_section = document.getElementById("tasks");
+      const tasks_container = document.getElementById("tasks-content");
+      const tasks_head = tasks_container?.querySelector("thead");
+      if (!task_row || !tasks_section || !tasks_container) {
+        return;
+      }
+      tasks_section.scrollIntoView();
+      const container_rect = tasks_container.getBoundingClientRect();
+      const row_rect = task_row.getBoundingClientRect();
+      const head_height = tasks_head?.getBoundingClientRect().height ?? 0;
+      const target_scroll_top =
+        tasks_container.scrollTop + row_rect.top - container_rect.top - head_height;
+      const max_scroll_top = Math.max(
+        0,
+        tasks_container.scrollHeight - tasks_container.clientHeight,
+      );
+      tasks_container.scrollTop = Math.min(
+        Math.max(0, target_scroll_top),
+        max_scroll_top,
+      );
     }
   </script>
 {% endif %}
@@ -65,11 +81,20 @@
   <h2>
     <span>{{ page_title }}</span>
     <a href="{{ diff_url(run, master_check=allow_github_api_calls) }}" target="_blank" rel="noopener noreferrer">diff</a>
+    {% set _status = ('failed' if run.get('failed') else 'finished') if run.get('finished') else ('active' if run.get('workers', 0) > 0 else ('paused' if run.get('approved') else 'pending')) %}
+    <span id="run-status-{{ run_id }}">{{ _status }}</span>
   </h2>
 
-  <div class="elo-results-top">
+    <div id="elo-{{ run_id }}" class="elo-results-top">
     {% include "elo_results.html.j2" %}
   </div>
+
+    {% if not run["finished"] %}
+    <div hx-get="/tests/elo/{{ run_id }}?expected={{ _status }}"
+      hx-trigger="every {{ poll.elo_detail }}s [document.visibilityState === 'visible'], visibilitychange[document.visibilityState === 'visible'] from:document"
+      hx-swap="none">
+    </div>
+    {% endif %}
 
   <div class="row">
     <div class="col-12 col-lg-9">
@@ -214,21 +239,17 @@
         {% if can_modify_run %}
           {% if not run["finished"] %}
             <div class="col-12 col-sm">
-              <form
-                action="/tests/stop"
-                method="POST"
-                data-stop-delete-run-id="{{ run_id }}"
-              >
+              <form action="/tests/stop" method="POST" data-stop-delete-run-id="{{ run_id }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="run-id" value="{{ run_id }}">
-                <button type="submit" class="btn btn-danger w-100">
-                  Stop
-                </button>
+                <button type="submit" class="btn btn-danger w-100">Stop</button>
               </form>
             </div>
 
             {% if not run.get("approved", False) and not same_user %}
               <div class="col-12 col-sm">
                 <form action="/tests/approve" method="POST">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                   <input type="hidden" name="run-id" value="{{ run_id }}">
                   <button type="submit" id="approve-btn"
                           class="btn {{ "btn-success" if warnings == [] else "btn-warning" }} w-100">
@@ -237,9 +258,11 @@
                 </form>
               </div>
             {% endif %}
+
           {% else %}
             <div class="col-12 col-sm">
               <form action="/tests/purge" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="run-id" value="{{ run_id }}">
                 <button type="submit" class="btn btn-danger w-100">Purge</button>
               </form>
@@ -346,6 +369,7 @@
             <label class="form-check-label" for="auto-purge">Auto-purge</label>
           </div>
 
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="run" value="{{ run_id }}">
           <button type="submit" class="btn btn-primary col-12 col-md-auto">Modify</button>
         </form>
@@ -437,42 +461,73 @@
       >
         {{ "Hide" if tasks_shown else "Show" }}
       </a>
-    Tasks {{ totals }}
+    Tasks <span id="tasks-totals">{{ totals }}</span>
   </h4>
   <section id="tasks"
-       class="overflow-auto {{ "collapse show" if tasks_shown else "collapse" }}">
-    <table class='table table-striped table-sm'>
-      <thead id="tasks-head" class="sticky-top">
-        <tr>
-          <th>Idx</th>
-          <th>Worker</th>
-          <th>Info</th>
-          <th>Last Updated</th>
-          <th>Played</th>
-          {% if "pentanomial" not in run["results"] %}
-            <th>Wins</th>
-            <th>Losses</th>
-            <th>Draws</th>
-          {% else %}
-            <th>Pentanomial&nbsp;[0&#8209;2]</th>
-          {% endif %}
-          <th>Crashes</th>
-          <th>Time</th>
+       class="collapse {{ "show" if tasks_shown else "" }}">
+    <form
+      id="tasks-filters"
+      class="row g-2 align-items-end mb-2"
+      method="get"
+      action="/tests/tasks/{{ run_id }}?show_task={{ show_task }}"
+      hx-get="/tests/tasks/{{ run_id }}?show_task={{ show_task }}"
+      hx-target="#tasks-content"
+      hx-swap="innerHTML"
+      hx-trigger="submit, input changed delay:{{ htmx.input_changed_delay_ms }}ms from:#tasks_q, search from:#tasks_q"
+    >
+      <input type="hidden" id="tasks_sort" name="sort" value="{{ tasks_sort }}">
+      <input type="hidden" id="tasks_order" name="order" value="{{ tasks_order }}">
+      <input type="hidden" id="tasks_view" name="view" value="{{ tasks_view }}">
+      <input type="hidden" id="tasks_page" name="page" value="{{ tasks_page }}">
 
-          {% if "spsa" not in run["args"] %}
-            <th>Residual</th>
-          {% endif %}
-        </tr>
-      </thead>
-      <tbody id="tasks-body"></tbody>
-    </table>
+      <div class="col-auto">
+        <input
+          id="tasks_q"
+          type="search"
+          name="q"
+          class="form-control form-control-sm"
+          value="{{ tasks_q }}"
+          placeholder="Filter worker or info"
+          aria-label="Filter worker or info"
+          autocomplete="off"
+        >
+      </div>
+
+      <div id="tasks-view-controls" class="col-auto">
+        {% with sort=tasks_sort, order=tasks_order, q=tasks_q, view=tasks_view, num_tasks=tasks_num_tasks, max_all=tasks_max_all, is_truncated=tasks_is_truncated %}
+          {% include "tasks_controls_fragment.html.j2" %}
+        {% endwith %}
+      </div>
+    </form>
+
+    {% set pagination_hx_target = "tasks-content" %}
+    {% set pagination_hx_push_url = false %}
+    {% set pagination_hx_disinherit = "hx-include" %}
+    {% set pagination_hx_params = "none" %}
+    <div id="tasks-pagination" aria-live="polite">
+      {% if tasks_view == "paged" %}
+        {% with pages=tasks_pages %}
+          {% include "pagination.html.j2" %}
+        {% endwith %}
+      {% endif %}
+    </div>
+
+    <div id="tasks-content"
+      data-tasks-loaded="0"
+      class="overflow-auto tasks-panel-scroll"
+      hx-get="/tests/tasks/{{ run_id }}?show_task={{ show_task }}"
+      hx-include="#tasks-filters"
+      hx-sync="#tasks-filters:abort"
+      hx-trigger="{% if tasks_shown %}load, tasks:load{% else %}tasks:load{% endif %}{% if not run['finished'] %}, every {{ poll.tasks_detail }}s [document.visibilityState === 'visible' && document.getElementById('tasks').classList.contains('show')], visibilitychange[document.visibilityState === 'visible' && document.getElementById('tasks').classList.contains('show')] from:document{% endif %}"
+      hx-swap="innerHTML"
+    ></div>
   </section>
 {# End of enclosing div to be able to make things invisible. #}
 </div>
 
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"
-        integrity="sha512-EBLzUL8XLl+va/zAsmXwS7Z2B1F9HUHkZwyS/VKwh3S7T/U0nF4BaU29EP/ZSf6zgiIxYAnKLu6bJ8dqpmX5uw=="
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/highlight.min.js"
+        integrity="sha256-xKOZ3W9Ii8l6NUbjR2dHs+cUyZxXuUcxVMb7jSWbk4E="
         crossorigin="anonymous"
         referrerpolicy="no-referrer"
 ></script>
@@ -492,9 +547,9 @@
       link["crossOrigin"] = "anonymous";
       link["referrerPolicy"] = "no-referrer";
       link["href"] =
-        "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css";
+        "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/styles/github-dark.min.css";
       link["integrity"] =
-        "sha512-rO+olRTkcf304DQBxSWxln8JXCzTHlKnIdnMUwYvQa9/Jd4cQaNkItIUj6Z4nvW1dqK0SKXLbn9h4KwZTNtAyw==";
+        "sha256-nyCNAiECsdDHrr/s2OQsp5l9XeY2ZJ0rMepjCT2AkBk=";
     } else {
       document.head
         .querySelector('link[href*="styles/github-dark.min.css"]')
@@ -503,9 +558,9 @@
       link["crossOrigin"] = "anonymous";
       link["referrerPolicy"] = "no-referrer";
       link["href"] =
-        "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github.min.css";
+        "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/styles/github.min.css";
       link["integrity"] =
-        "sha512-0aPQyyeZrWj9sCA46UlmWgKOP0mUipLQ6OZXu8l4IcAmD2u31EPEy9VcIMvl7SoAaKe8bLXZhYoMaE/in+gcgA==";
+        "sha256-Oppd74ucMR5a5Dq96FxjEzGF7tTw2fZ/6ksAqDCM8GY=";
     }
     document.head.append(link);
   };
@@ -597,52 +652,61 @@
   const downloadPGNsButton = document.getElementById("download_games");
   downloadPGNsButton?.addEventListener("click", downloadPGNs);
 
-  let fetchedTasksBefore = false;
-  async function handleRenderTasks(){
-    await DOMContentLoaded();
-    const tasksButton = document.getElementById("tasks-button");
-    tasksButton?.addEventListener("click", async () => {
-      await toggleTasks();
-    })
-     if ({{ 'true' if tasks_shown else 'false' }})
-       await renderTasks();
+  let resolveTasksLoaded = null;
+  {% if show_task >= 0 %}
+  const tasksPromise = new Promise(resolve => { resolveTasksLoaded = resolve; });
+  {% else %}
+  const tasksPromise = Promise.resolve();
+  {% endif %}
+
+  const tasksContainer = document.getElementById("tasks-content");
+  const resolveTasksLoadedOnce = () => {
+    if (!tasksContainer) {
+      return;
+    }
+    tasksContainer.dataset.tasksLoaded = "1";
+    resolveTasksLoaded?.();
+    resolveTasksLoaded = null;
+  };
+
+  const clearTasksLoadingState = () => {
+    if (!tasksContainer) {
+      resolveTasksLoaded?.();
+      resolveTasksLoaded = null;
+      return;
+    }
+    tasksContainer.dataset.tasksLoaded = "0";
+    resolveTasksLoaded?.();
+    resolveTasksLoaded = null;
+  };
+
+  tasksContainer?.addEventListener("htmx:afterSwap", resolveTasksLoadedOnce);
+  tasksContainer?.addEventListener("htmx:responseError", clearTasksLoadingState);
+  tasksContainer?.addEventListener("htmx:sendError", clearTasksLoadingState);
+  if (tasksContainer && (tasksContainer.dataset.tasksLoaded === "1" || tasksContainer.children.length > 0)) {
+    resolveTasksLoadedOnce();
   }
+
+  (async () => {
+    await DOMContentLoaded();
+    const btn = document.getElementById("tasks-button");
+    btn?.addEventListener("click", () => {
+      const active = btn.textContent.trim() === "Hide";
+      btn.textContent = active ? "Show" : "Hide";
+      document.cookie =
+        "tasks_state=" + btn.textContent.trim() +
+        "; path=/; max-age={{ 60 * 60 }}; SameSite=Lax";
+      if (!active && tasksContainer && tasksContainer.dataset.tasksLoaded !== "1") {
+        tasksContainer.dataset.tasksLoaded = "loading";
+        htmx.trigger(tasksContainer, "tasks:load");
+      }
+    });
+  })();
 
   const followButton = document.getElementById("follow_button_" + runId);
   followButton?.addEventListener("click", (e) => {
     handleFollowButton(e.currentTarget);
   });
-
-  async function renderTasks() {
-    await DOMContentLoaded();
-    if (fetchedTasksBefore)
-      return Promise.resolve();
-    const tasksBody = document.getElementById("tasks-body");
-    try {
-      const showTask = {{ show_task | tojson }};
-      const tasksUrl = `/tests/tasks/${encodeURIComponent(runId)}?show_task=${encodeURIComponent(showTask)}`;
-      const html = await fetchText(tasksUrl);
-      tasksBody.innerHTML = html;
-      fetchedTasksBefore = true;
-    } catch (error) {
-      console.log("Request failed: " + error);
-    }
-  }
-
-  async function toggleTasks() {
-    const button = document.getElementById("tasks-button");
-    const active = button.textContent.trim() === "Hide";
-    if (active){
-      button.textContent = "Show";
-    }
-    else {
-      await renderTasks();
-      button.textContent = "Hide";
-    }
-
-    document.cookie =
-      "tasks_state" + "=" + button.textContent.trim() + "; max-age={{ 60 * 60 }}; SameSite=Lax";
-  }
 
   function addDiff (diffText, text) {
     diffText.textContent = text;
@@ -989,11 +1053,15 @@
   }
 
   const diffPromise = handleDiff();
-  const tasksPromise = handleRenderTasks();
+
+  const nextFrame = () => new Promise((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
 
   Promise.all([spsaPromise, diffPromise, tasksPromise])
-    .then(() => {
+    .then(async () => {
     {% if show_task >= 0 %}
+      await nextFrame();
       scroll_to({{ show_task }});
       document.getElementById("enclosure").style="visibility:visible;";
       document.documentElement.style="overflow:scroll;";

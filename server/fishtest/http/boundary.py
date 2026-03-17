@@ -1,6 +1,7 @@
-"""Shared HTTP boundary (FastAPI UI/API).
+"""Bridge FastAPI requests to the legacy fishtest HTTP surface.
 
-Ownership: request shims, session commit helpers, and template context wiring.
+Provide request shims, session-commit helpers, and shared template-context
+wiring for the UI and API layers.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ from typing import TYPE_CHECKING, Protocol, cast
 from starlette.requests import Request
 
 from fishtest.http.cookie_session import (
-    REMEMBER_MAX_AGE_SECONDS,
     CookieSession,
     authenticated_user,
     is_https,
@@ -28,6 +28,7 @@ from fishtest.http.dependencies import (
     get_userdb,
 )
 from fishtest.http.jinja import static_url
+from fishtest.http.settings import SESSION_REMEMBER_MAX_AGE_SECONDS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -151,7 +152,7 @@ def commit_session_flags(
         max_age = (
             flags.remember_max_age
             if flags.remember_max_age is not None
-            else REMEMBER_MAX_AGE_SECONDS
+            else SESSION_REMEMBER_MAX_AGE_SECONDS
         )
         mark_session_max_age(request, max_age)
         request.scope["session_secure"] = is_https(request)
@@ -282,9 +283,7 @@ def build_template_context(
             "signup": "/signup",
             "user_profile": "/user",
             "tests": "/tests",
-            "tests_finished_ltc": "/tests/finished?ltc_only=1",
-            "tests_finished_success": "/tests/finished?success_only=1",
-            "tests_finished_yellow": "/tests/finished?yellow_only=1",
+            "tests_finished": "/tests/finished",
             "tests_run": "/tests/run",
             "tests_user_prefix": "/tests/user/",
             "tests_machines": "/tests/machines",

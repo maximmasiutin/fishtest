@@ -1,7 +1,7 @@
-"""Session helpers for the FastAPI UI.
+"""Provide cookie-backed session helpers for the FastAPI UI.
 
-This keeps the legacy `CookieSession` surface while delegating persistence to
-Starlette's session middleware. The session data lives in `request.scope["session"]`.
+Keep the legacy ``CookieSession`` surface while delegating persistence to
+Starlette session middleware backed by ``request.scope["session"]``.
 """
 
 from __future__ import annotations
@@ -19,8 +19,6 @@ if TYPE_CHECKING:
 
 SESSION_COOKIE_NAME: Final[str] = "fishtest_session"
 DEFAULT_SAMESITE: Final[Literal["lax", "strict", "none"]] = "lax"
-REMEMBER_MAX_AGE_SECONDS: Final[int] = 60 * 60 * 24 * 365
-MAX_COOKIE_BYTES: Final[int] = 3800
 INSECURE_DEV_ENV: Final[str] = "FISHTEST_INSECURE_DEV"
 
 
@@ -165,8 +163,6 @@ def is_https(request: Request) -> bool:
 __all__ = [
     "DEFAULT_SAMESITE",
     "INSECURE_DEV_ENV",
-    "MAX_COOKIE_BYTES",
-    "REMEMBER_MAX_AGE_SECONDS",
     "SESSION_COOKIE_NAME",
     "CookieSession",
     "MissingAuthenticationSecretError",

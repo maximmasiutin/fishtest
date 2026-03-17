@@ -1,11 +1,23 @@
+"""Dispatch fishtest UI routes and preserve the legacy request contract.
+
+Group the UI layer into authentication, list pages, neural-network tools,
+user and contributor flows, homepage run lists, run mutation, run detail, and
+router registration.
+"""
+
+from __future__ import annotations
+
+import contextlib
 import copy
 import gzip
 import hashlib
+import logging
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from typing import TYPE_CHECKING, Any, TypedDict
+from urllib.parse import quote, unquote, urlencode
 
 import bson
 import regex
@@ -14,8 +26,8 @@ from fastapi import APIRouter
 from markupsafe import Markup
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.requests import Request  # noqa: TC002
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 from vtjson import ValidationError, union, validate
 
 import fishtest.github_api as gh
@@ -28,7 +40,7 @@ from fishtest.http.boundary import (
     remember,
 )
 from fishtest.http.cookie_session import (
-    REMEMBER_MAX_AGE_SECONDS,
+    CookieSession,
     authenticated_user,
 )
 from fishtest.http.csrf import csrf_token_from_form
@@ -38,6 +50,25 @@ from fishtest.http.dependencies import (
     get_rundb,
     get_userdb,
     get_workerdb,
+)
+from fishtest.http.settings import (
+    ACTIONS_PAGE_SIZE,
+    CONTRIBUTORS_MAX_ALL,
+    CONTRIBUTORS_PAGE_SIZE,
+    NNS_MAX_ALL,
+    NNS_PAGE_SIZE,
+    PERSISTENT_UI_COOKIE_MAX_AGE_SECONDS,
+    SESSION_REMEMBER_MAX_AGE_SECONDS,
+    TASKS_MAX_ALL,
+    TASKS_PAGE_SIZE,
+    UI_FORM_MAX_FIELDS,
+    UI_FORM_MAX_FILES,
+    UI_FORM_MAX_PART_SIZE_BYTES,
+    UI_HTTP_TIMEOUT_SECONDS,
+    USER_MANAGEMENT_MAX_ALL,
+    USER_MANAGEMENT_PAGE_SIZE,
+    WORKERS_MAX_ALL,
+    WORKERS_PAGE_SIZE,
 )
 from fishtest.http.template_helpers import (
     build_contributors_rows,
@@ -58,16 +89,13 @@ from fishtest.schemas import (
     runs_schema,
     short_worker_name,
 )
-from fishtest.schemas import tc as tc_schema
 from fishtest.util import (
     VALID_USERNAME_PATTERN,
     email_valid,
-    format_bounds,
     format_date,
     format_group,
     format_time_ago,
     get_chi2,
-    get_hash,
     get_tc_ratio,
     is_sprt_ltc_data,
     password_strength,
@@ -76,20 +104,270 @@ from fishtest.util import (
     supported_arches,
     supported_compilers,
     tests_repo,
-    worker_name,
+)
+from fishtest.views_actions import actions as _actions_impl
+from fishtest.views_finished import get_paginated_finished_runs
+from fishtest.views_helpers import (
+    _SORT_ORDER_VALUES,
+    _append_no_store_headers,
+    _append_vary_header,
+    _apply_response_headers,
+    _build_query_string,
+    _clamp_page_index,
+    _host_url,
+    _is_hx_request,
+    _is_truthy_param,
+    _normalize_sort_order,
+    _normalize_view_mode,
+    _page_index_from_params,
+    _path_qs,
+    pagination,
+)
+from fishtest.views_machines import (
+    _MACHINES_DEFAULT_SORT,
+    _MACHINES_PAGE_SIZE,  # noqa: F401 — re-exported for test_users.py
+    _MACHINES_SORT_MAP,
+    _filtered_machine_count,
+    _machine_filter_state,
+    _workers_count_label,
+)
+from fishtest.views_machines import tests_machines as _tests_machines_impl
+from fishtest.views_run import (
+    can_modify_run,
+    del_tasks,
+    get_master_info,
+    get_nets,  # noqa: F401 — re-exported for test_github_api.py
+    get_sha,  # noqa: F401 — re-exported for test_github_api.py
+    is_same_user,
+    new_run_message,
+    parse_spsa_params,  # noqa: F401 — re-exported for test compatibility
+    sanitize_options,
+    update_nets,
+    validate_form,
+    validate_modify,
 )
 
-HTTP_TIMEOUT = 15.0
-FORM_MAX_FILES = 2
-FORM_MAX_FIELDS = 200
-FORM_MAX_PART_SIZE = 200 * 1024 * 1024
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+HTTP_TIMEOUT = UI_HTTP_TIMEOUT_SECONDS
+FORM_MAX_FILES = UI_FORM_MAX_FILES
+FORM_MAX_FIELDS = UI_FORM_MAX_FIELDS
+FORM_MAX_PART_SIZE = UI_FORM_MAX_PART_SIZE_BYTES
 DEFAULT_RECAPTCHA_SITE_KEY = "6LePs8YUAAAAABMmqHZVyVjxat95Z1c_uHrkugZM"
 
 router = APIRouter(tags=["ui"])
+logger = logging.getLogger(__name__)
+
+_LTC_TC_RATIO_THRESHOLD = 4
+_WORKER_NAME_PARTS = 3
+_MAX_NETWORK_SIZE_BYTES = 200_000_000
+_THROUGHPUT_NORMAL_LIMIT = 100
+_MIN_BOOK_EXITS = 100_000
+_RUN_AGE_GITHUB_API_MAX_DAYS = 30
+
+_ACTIVE_RUN_FILTER_VALUES = {
+    "test-type": ("sprt", "spsa", "numgames"),
+    "time-control": ("stc", "ltc"),
+    "threads": ("st", "smp"),
+}
+_ACTIVE_RUN_FILTER_DIMENSION_BY_VALUE = {
+    value: dimension
+    for dimension, values in _ACTIVE_RUN_FILTER_VALUES.items()
+    for value in values
+}
+
+type _RunTableRow = dict[str, str | list[dict[object, object]] | bool]
+type _RunTableRows = list[_RunTableRow]
+type _SpsaTableRow = list[str]
+type _RunArgValue = str | list[str | _SpsaTableRow]
+type _RunArg = tuple[str, _RunArgValue, str]
+
+
+class _ActiveRunFilterContext(TypedDict):
+    all_enabled: bool
+    count_text: str
+    enabled_by_dim: dict[str, tuple[str, ...]]
+    hidden_selectors: list[str]
+    style_text: str
+    ordered_runs: list[dict]
+
+
+class _BatchPanel(TypedDict):
+    tbody_id: str
+    rows: _RunTableRows
+    show_delete: bool
+    empty_text: str
+
+
+class _CountUpdate(TypedDict):
+    id: str
+    text: str
+
+
+class _BatchStats(TypedDict):
+    pending_hours: str
+    cores: int
+    nps_m: str
+    games_per_minute: int
+
+
+def _classify_active_run_filters(run: dict) -> dict[str, str]:
+    args = run.get("args", {})
+    is_spsa = "spsa" in args
+    is_sprt = "sprt" in args and not is_spsa
+    test_type = "spsa" if is_spsa else ("sprt" if is_sprt else "numgames")
+    time_control = (
+        "ltc"
+        if get_tc_ratio(args.get("tc", "10+0.1"), args.get("threads", 1))
+        > _LTC_TC_RATIO_THRESHOLD
+        else "stc"
+    )
+    try:
+        threads = int(args.get("threads", 1))
+    except TypeError, ValueError:
+        threads = 1
+    thread_group = "smp" if threads > 1 else "st"
+    return {
+        "test-type": test_type,
+        "time-control": time_control,
+        "threads": thread_group,
+    }
+
+
+def _default_active_run_filter_state() -> dict[str, set[str]]:
+    return {
+        dimension: set(values)
+        for dimension, values in _ACTIVE_RUN_FILTER_VALUES.items()
+    }
+
+
+def _parse_active_run_filter_cookie(raw: str) -> dict[str, set[str]]:
+    raw = raw.strip()
+    if not raw:
+        return _default_active_run_filter_state()
+    if raw == "none":
+        return {dimension: set() for dimension in _ACTIVE_RUN_FILTER_VALUES}
+
+    parsed = {dimension: set() for dimension in _ACTIVE_RUN_FILTER_VALUES}
+    saw_valid_value = False
+    for token in raw.split(","):
+        value = token.strip()
+        dimension = _ACTIVE_RUN_FILTER_DIMENSION_BY_VALUE.get(value)
+        if dimension is None:
+            continue
+        parsed[dimension].add(value)
+        saw_valid_value = True
+
+    return parsed if saw_valid_value else _default_active_run_filter_state()
+
+
+def _active_run_matches_enabled_filters(
+    run: dict,
+    enabled_by_dim: dict[str, set[str]],
+) -> bool:
+    classifications = _classify_active_run_filters(run)
+    return all(
+        classifications[dimension] in enabled_by_dim[dimension]
+        for dimension in _ACTIVE_RUN_FILTER_VALUES
+    )
+
+
+def _order_active_runs_for_filters(
+    active_runs: list[dict],
+    enabled_by_dim: dict[str, set[str]],
+) -> tuple[list[dict], int]:
+    visible_runs: list[dict] = []
+    hidden_runs: list[dict] = []
+
+    for index, run in enumerate(active_runs):
+        run_copy = dict(run)
+        run_copy["_active_filter_index"] = index
+        if _active_run_matches_enabled_filters(run_copy, enabled_by_dim):
+            visible_runs.append(run_copy)
+        else:
+            hidden_runs.append(run_copy)
+
+    return visible_runs + hidden_runs, len(visible_runs)
+
+
+def _build_active_run_filter_context(
+    request: _ViewContext,
+    active_runs: list[dict],
+) -> _ActiveRunFilterContext:
+    enabled_by_dim = _parse_active_run_filter_cookie(
+        request.cookies.get("active_run_filters", ""),
+    )
+    hidden_selectors: list[str] = []
+    style_text = ""
+    ordered_runs, visible_count = _order_active_runs_for_filters(
+        active_runs,
+        enabled_by_dim,
+    )
+
+    all_enabled = True
+    for dimension, values in _ACTIVE_RUN_FILTER_VALUES.items():
+        enabled_values = enabled_by_dim[dimension]
+        if len(enabled_values) < len(values):
+            all_enabled = False
+        hidden_selectors.extend(
+            f'#active-tbody tr[data-{dimension}="{value}"]'
+            for value in values
+            if value not in enabled_values
+        )
+
+    if hidden_selectors:
+        hidden_rows = ",\n".join(hidden_selectors)
+        style_text = f"{hidden_rows} {{ display: none !important; }}"
+
+    total_count = len(active_runs)
+    count_text = (
+        f"Active - {total_count} tests"
+        if all_enabled
+        else f"Active - {total_count} ({visible_count}) tests"
+    )
+
+    return {
+        "all_enabled": all_enabled,
+        "count_text": count_text,
+        "enabled_by_dim": {
+            dimension: tuple(
+                value for value in values if value in enabled_by_dim[dimension]
+            )
+            for dimension, values in _ACTIVE_RUN_FILTER_VALUES.items()
+        },
+        "hidden_selectors": hidden_selectors,
+        "style_text": style_text,
+        "ordered_runs": ordered_runs,
+    }
+
+
+class _TestsEloBatchContext(TypedDict, total=False):
+    panels: list[_BatchPanel]
+    count_updates: list[_CountUpdate]
+    machines_count: int
+    workers_count_text: str
+    stats: _BatchStats
 
 
 class _ViewContext:
-    def __init__(self, request, session, post, matchdict, context=None):
+    """Compatibility shim for the legacy sync view functions.
+
+    The UI layer still uses Pyramid-style handlers that expect a rich request
+    object with DB handles, session helpers, and a mutable response header bag.
+    FastAPI/Starlette requests are adapted once in `_dispatch_view()` so the
+    individual handlers can stay synchronous and focused on shaping template
+    context.
+    """
+
+    def __init__(
+        self,
+        request: Request,
+        session: CookieSession,
+        post: Any,  # noqa: ANN401
+        matchdict: dict[str, str],
+        context: Any = None,  # noqa: ANN401
+    ) -> None:
         self._request = request
         self.raw_request = request
         self.session = session
@@ -131,10 +409,10 @@ class _ViewContext:
             self.workerdb = context["workerdb"]
 
     @property
-    def authenticated_userid(self):
+    def authenticated_userid(self) -> str | None:
         return authenticated_user(self.session)
 
-    def has_permission(self, permission):
+    def has_permission(self, permission: str) -> bool:
         if permission != "approve_run":
             return False
         username = self.authenticated_userid
@@ -147,15 +425,12 @@ class _ViewContext:
 _RequestShim = _ViewContext
 
 
-def _apply_response_headers(shim, response):
-    for key, value in getattr(shim, "response_headers", {}).items():
-        response.headers[key] = value
-    for key, value in getattr(shim, "response_headerlist", []):
-        response.headers[key] = value
-    return response
-
-
-async def _dispatch_view(fn, cfg, request, path_params):
+async def _dispatch_view(
+    fn: Callable[..., Any],
+    cfg: dict[str, Any],
+    request: Request,
+    path_params: dict[str, str],
+) -> Response:
     context = get_request_context(request)
     session = context["session"]
     post = None
@@ -189,14 +464,21 @@ async def _dispatch_view(fn, cfg, request, path_params):
 
     result = await run_in_threadpool(fn, shim)
 
-    if isinstance(result, RedirectResponse):
+    if isinstance(result, Response):
         commit_session_response(request, session, shim, result)
+        apply_http_cache(result, cfg)
+        if request.method == "GET":
+            # Same URL can serve full page or htmx fragment depending on headers.
+            _append_vary_header(result, "HX-Request")
         return _apply_response_headers(shim, result)
 
+    status_code = getattr(shim, "response_status", 200) or 200
+
     renderer = cfg.get("renderer")
-    if isinstance(renderer, str):
+    if int(status_code) == 204:  # noqa: PLR2004
+        response = HTMLResponse("", status_code=204)
+    elif isinstance(renderer, str):
         context = result if isinstance(result, dict) else {}
-        status_code = getattr(shim, "response_status", 200) or 200
         response = await run_in_threadpool(
             render_template_to_response,
             request=request,
@@ -210,123 +492,49 @@ async def _dispatch_view(fn, cfg, request, path_params):
 
     commit_session_response(request, session, shim, response)
     apply_http_cache(response, cfg)
+    if request.method == "GET":
+        # Several UI endpoints return either full-page HTML or fragment HTML
+        # for the same URL based on the HX-Request header.
+        _append_vary_header(response, "HX-Request")
     return _apply_response_headers(shim, response)
 
 
-def pagination(page_idx, num, page_size, query_params):
-    pages = [
-        {
-            "idx": "Prev",
-            "url": "?page={}".format(page_idx) + query_params,
-            "state": "disabled" if page_idx == 0 else "",
-        }
-    ]
+# === Authentication ===
 
-    if num <= 0:
-        pages.append(
-            {
-                "idx": 1,
-                "url": "?page=1" + query_params,
-                "state": "active" if page_idx == 0 else "",
-            }
-        )
-        pages.append(
-            {
-                "idx": "Next",
-                "url": "?page={}".format(page_idx + 2) + query_params,
-                "state": "disabled",
-            }
-        )
-        return pages
 
-    last_idx = (num - 1) // page_size
-
-    disable_next = page_idx >= last_idx
-
-    def add_page(idx):
-        pages.append(
-            {
-                "idx": idx + 1,
-                "url": "?page={}".format(idx + 1) + query_params,
-                "state": "active" if page_idx == idx else "",
-            }
-        )
-
-    # Always show page 1.
-    add_page(0)
-
-    # Compact mobile-friendly layout:
-    # Prev, 1, ..., (current-1,current,current+1), ..., last, Next
-    if page_idx <= 2:
-        for idx in range(1, min(last_idx, 4)):
-            add_page(idx)
-    elif page_idx >= last_idx - 2:
-        pages.append({"idx": "...", "url": "", "state": "disabled"})
-        for idx in range(max(1, last_idx - 3), last_idx):
-            add_page(idx)
-    else:
-        pages.append({"idx": "...", "url": "", "state": "disabled"})
-        for idx in (page_idx - 1, page_idx, page_idx + 1):
-            add_page(idx)
-
-    if last_idx >= 5 and page_idx < last_idx - 2:
-        pages.append({"idx": "...", "url": "", "state": "disabled"})
-
-    if last_idx > 0:
-        add_page(last_idx)
-
-    pages.append(
-        {
-            "idx": "Next",
-            "url": "?page={}".format(page_idx + 2) + query_params,
-            "state": "disabled" if disable_next else "",
-        }
+def _render_hx_fragment(
+    request: _ViewContext,
+    template_name: str,
+    context: dict[str, Any],
+) -> Response | None:
+    if not _is_hx_request(request):
+        return None
+    return render_template_to_response(
+        request=request.raw_request,
+        template_name=template_name,
+        context=build_template_context(request.raw_request, request.session, context),
     )
-    return pages
 
 
-def _host_url(request) -> str:
-    host_url = getattr(request, "host_url", None)
-    if host_url:
-        return host_url.rstrip("/")
-    return str(request.base_url).rstrip("/")
+def _render_hx_or_context(
+    request: _ViewContext,
+    template_name: str,
+    context: dict[str, Any],
+    *,
+    extra_context: dict[str, Any] | None = None,
+) -> Response | dict[str, Any]:
+    hx_context = context if extra_context is None else {**context, **extra_context}
+    return _render_hx_fragment(request, template_name, hx_context) or context
 
 
-def _path_qs(request) -> str:
-    path_qs = getattr(request, "path_qs", None)
-    if path_qs:
-        return path_qs
-    url = getattr(request, "url", None)
-    if url is None:
-        path = getattr(request, "path", "")
-        query_params = getattr(request, "params", {})
-        query = urlencode(query_params) if query_params else ""
-        return path if not query else f"{path}?{query}"
-    query = url.query if hasattr(url, "query") else ""
-    path = url.path if hasattr(url, "path") else str(url).split("?", 1)[0]
-    return path if not query else f"{path}?{query}"
-
-
-def _path_url(request) -> str:
-    path_url = getattr(request, "path_url", None)
-    if path_url:
-        return path_url
-    url = getattr(request, "url", None)
-    if url is None:
-        host_url = _host_url(request)
-        path = getattr(request, "path", "")
-        return f"{host_url}{path}"
-    return str(url).split("?", 1)[0]
-
-
-# === Home redirect ===
-def home(request=None):
+# === Home Redirect ===
+def home(request: object = None) -> RedirectResponse:  # noqa: ARG001
     """Redirect / to /tests. Registered directly on the router (no _dispatch_view)."""
     return RedirectResponse(url="/tests", status_code=302)
 
 
-# === Authentication views ===
-def ensure_logged_in(request):
+# === Login And Signup ===
+def ensure_logged_in(request: _ViewContext) -> str | RedirectResponse:
     """Return authenticated user id or a login RedirectResponse.
 
     Pyramid used exception-based redirect control flow. In the FastAPI port,
@@ -342,7 +550,7 @@ def ensure_logged_in(request):
     return userid
 
 
-def login(request):
+def login(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
     userid = request.authenticated_userid
     if userid:
         return home(request)
@@ -376,10 +584,10 @@ def login(request):
         if "error" not in token:
             if stay_logged_in:
                 # Session persists for a year after login
-                remember(request, username, max_age=REMEMBER_MAX_AGE_SECONDS)
+                remember(request, username, max_age=SESSION_REMEMBER_MAX_AGE_SECONDS)  # type: ignore[invalid-argument-type]
             else:
                 # Session ends when the browser is closed
-                remember(request, username)
+                remember(request, username)  # type: ignore[invalid-argument-type]
             next_page = request.params.get("next") or came_from
             return RedirectResponse(url=next_page, status_code=302)
         message = token["error"]
@@ -395,259 +603,14 @@ def login(request):
     return {}
 
 
-# === Worker administration ===
-# Note that the allowed length of mailto URLs on Chrome/Windows is severely
-# limited.
-def worker_email(worker_name, blocker_name, message, host_url, blocked):
-    owner_name = worker_name.split("-")[0]
-    body = f"""\
-Dear {owner_name},
-
-Thank you for contributing to the development of Stockfish. Unfortunately, it seems your Fishtest worker {worker_name} has some issue(s). More specifically the following has been reported:
-
-{message}
-
-You may possibly find more information about this in our event log at {host_url}/actions
-
-Feel free to reply to this email if you require any help, or else contact the #fishtest-dev channel on the Stockfish Discord server: https://discord.com/invite/awnh2qZfTT
-
-Enjoy your day,
-
-{blocker_name} (Fishtest approver)
-
-"""
-    return body
-
-
-def normalize_lf(m):
-    m = m.replace("\r\n", "\n").replace("\r", "\n")
-    return m.rstrip()
-
-
-def _blocked_worker_rows(blocked_workers, *, show_email):
-    rows = []
-    for worker in blocked_workers:
-        worker_name_value = worker.get("worker_name", "")
-        last_updated = worker.get("last_updated")
-        last_updated_label = (
-            format_time_ago(last_updated) if last_updated is not None else "Never"
-        )
-        actions_url = f"/actions?text={quote(f'"{worker_name_value}"')}"
-        owner_email = worker.get("owner_email", "")
-        subject = worker.get("subject", "")
-        body = worker.get("body", "")
-        mailto_url = ""
-        if show_email and owner_email:
-            body_encoded = quote(body.replace("\n", "\r\n"))
-            mailto_url = (
-                f"mailto:{owner_email}?subject={quote(subject)}&body={body_encoded}"
-            )
-        rows.append(
-            {
-                "worker_name": worker_name_value,
-                "last_updated_label": last_updated_label,
-                "actions_url": actions_url,
-                "owner_email": owner_email,
-                "mailto_url": mailto_url,
-            }
-        )
-    return rows
-
-
-def workers(request):
-    is_approver = request.has_permission("approve_run")
-
-    blocked_workers = request.rundb.workerdb.get_blocked_workers()
-    blocker_name = request.authenticated_userid
-
-    # If we are approver then we are logged in, so blocker_name is not None
-    if is_approver:
-        for w in blocked_workers:
-            owner_name = w["worker_name"].split("-")[0]
-            owner = request.userdb.get_user(owner_name)
-            w["owner_email"] = owner["email"] if owner is not None else ""
-            w["body"] = worker_email(
-                w["worker_name"],
-                blocker_name,
-                w["message"],
-                _host_url(request),
-                w["blocked"],
-            )
-            w["subject"] = f"Issue(s) with worker {w['worker_name']}"
-
-    worker_name = request.matchdict.get("worker_name")
-    try:
-        validate(union(short_worker_name, "show"), worker_name, name="worker_name")
-    except ValidationError as e:
-        request.session.flash(str(e), "error")
-        return {
-            "show_admin": False,
-            "show_email": is_approver,
-            "blocked_workers": _blocked_worker_rows(
-                blocked_workers,
-                show_email=is_approver,
-            ),
-        }
-    if len(worker_name.split("-")) != 3:
-        return {
-            "show_admin": False,
-            "show_email": is_approver,
-            "blocked_workers": _blocked_worker_rows(
-                blocked_workers,
-                show_email=is_approver,
-            ),
-        }
-    result = ensure_logged_in(request)
-    if isinstance(result, RedirectResponse):
-        return result
-    owner_name = worker_name.split("-")[0]
-    if not is_approver and blocker_name != owner_name:
-        request.session.flash("Only owners and approvers can block/unblock", "error")
-        return {
-            "show_admin": False,
-            "show_email": is_approver,
-            "blocked_workers": _blocked_worker_rows(
-                blocked_workers,
-                show_email=is_approver,
-            ),
-        }
-
-    if request.method == "POST":
-        button = request.POST.get("submit")
-        if button == "Submit":
-            blocked = request.POST.get("blocked") is not None
-            message = request.POST.get("message")
-            max_chars = 500
-            if len(message) > max_chars:
-                request.session.flash(
-                    f"Warning: your description of the issue has been truncated to {max_chars} characters",
-                    "error",
-                )
-                message = message[:max_chars]
-            message = normalize_lf(message)
-            was_blocked = request.workerdb.get_worker(worker_name)["blocked"]
-            request.rundb.workerdb.update_worker(
-                worker_name, blocked=blocked, message=message
-            )
-            if blocked != was_blocked:
-                request.session.flash(
-                    f"Worker {worker_name} {'blocked' if blocked else 'unblocked'}!",
-                )
-                request.actiondb.block_worker(
-                    username=blocker_name,
-                    worker=worker_name,
-                    message="blocked" if blocked else "unblocked",
-                )
-        return RedirectResponse(url="/workers/show", status_code=302)
-
-    w = request.rundb.workerdb.get_worker(worker_name)
-    return {
-        "show_admin": True,
-        "worker_name": worker_name,
-        "blocked": w["blocked"],
-        "message": w["message"],
-        "show_email": is_approver,
-        "last_updated_label": (
-            format_time_ago(w["last_updated"]) if w["last_updated"] else "Never"
-        ),
-        "blocked_workers": _blocked_worker_rows(
-            blocked_workers,
-            show_email=is_approver,
-        ),
-    }
-
-
-# === Neural network uploads + tools ===
-def upload(request):
-    result = ensure_logged_in(request)
-    if isinstance(result, RedirectResponse):
-        return result
-    base_context = {
-        "upload_url": str(request.url),
-        "testing_guidelines_url": "https://github.com/official-stockfish/fishtest/wiki/Creating-my-first-test",
-        "cc0_url": "https://creativecommons.org/share-your-work/public-domain/cc0/",
-        "nn_stats_url": "/nns",
-    }
-
-    if request.method != "POST":
-        return base_context
-    try:
-        filename = request.POST["network"].filename
-        input_file = request.POST["network"].file
-        network = input_file.read()
-    except AttributeError:
-        request.session.flash(
-            "Specify a network file with the 'Choose File' button", "error"
-        )
-        return base_context
-    except Exception as e:
-        print("Error reading the network file:", e)
-        request.session.flash("Error reading the network file", "error")
-        return base_context
-    if request.rundb.get_nn(filename):
-        request.session.flash(f"Network {filename} already exists", "error")
-        return base_context
-    errors = []
-    if len(network) >= 200000000:
-        errors.append("Network must be < 200MB")
-    if not re.match(r"^nn-[0-9a-f]{12}\.nnue$", filename):
-        errors.append('Name must match "nn-[SHA256 first 12 digits].nnue"')
-    hash = hashlib.sha256(network).hexdigest()
-    if hash[:12] != filename[3:15]:
-        errors.append(f"Wrong SHA256 hash: {hash[:12]} Filename: {filename[3:15]}")
-    if errors:
-        for error in errors:
-            request.session.flash(error, "error")
-        return base_context
-    net_file_gz = Path("/var/www/fishtest/nn") / f"{filename}.gz"
-    try:
-        with gzip.open(net_file_gz, "xb") as f:
-            f.write(network)
-    except FileExistsError as e:
-        print(f"Network {filename} already uploaded:", e)
-        request.session.flash(f"Network {filename} already uploaded", "error")
-        return base_context
-    except Exception as e:
-        net_file_gz.unlink(missing_ok=True)
-        print(f"Failed to write network {filename}:", e)
-        request.session.flash(f"Failed to write network {filename}", "error")
-        return base_context
-    try:
-        net_data = gzip.decompress(net_file_gz.read_bytes())
-    except Exception as e:
-        net_file_gz.unlink()
-        print(f"Failed to read uploaded network {filename}:", e)
-        request.session.flash(f"Failed to read uploaded network {filename}", "error")
-        return base_context
-
-    hash = hashlib.sha256(net_data).hexdigest()
-    if hash[:12] != filename[3:15]:
-        net_file_gz.unlink()
-        request.session.flash(f"Invalid hash for uploaded network {filename}", "error")
-        return base_context
-
-    if request.rundb.get_nn(filename):
-        request.session.flash(f"Network {filename} already exists", "error")
-        return base_context
-
-    request.rundb.upload_nn(request.authenticated_userid, filename)
-
-    request.actiondb.upload_nn(
-        username=request.authenticated_userid,
-        nn=filename,
-    )
-
-    return RedirectResponse(url="/nns", status_code=302)
-
-
-def logout(request):
+def logout(request: _ViewContext) -> RedirectResponse:
     session = request.session
     forget(request)
     session.invalidate()
     return RedirectResponse(url="/tests", status_code=302)
 
 
-def signup(request):
+def signup(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C901, PLR0911, PLR0912
     recaptcha_site_key = os.environ.get(
         "FISHTEST_CAPTCHA_SITE_KEY",
         DEFAULT_RECAPTCHA_SITE_KEY,
@@ -670,7 +633,9 @@ def signup(request):
     tests_repo = request.POST.get("tests_repo", "").strip()
 
     strong_password, password_err = password_strength(
-        signup_password, signup_username, signup_email
+        signup_password,
+        signup_username,
+        signup_email,
     )
     if not strong_password:
         errors.append(password_err)
@@ -687,7 +652,7 @@ def signup(request):
     try:
         validate(union(github_repo, ""), tests_repo, "tests_repo")
     except ValidationError as e:
-        errors.append(f"Error! Invalid tests repo {tests_repo}: {str(e)}")
+        errors.append(f"Error! Invalid tests repo {tests_repo}: {e!s}")
 
     if errors:
         for error in errors:
@@ -722,7 +687,7 @@ def signup(request):
 
     if "success" not in response or not response["success"]:
         if "error-codes" in response:
-            print(response["error-codes"])
+            logger.warning(response["error-codes"])
         request.session.flash("Captcha failed", "error")
         return signup_context
 
@@ -742,28 +707,558 @@ def signup(request):
             "Account created! "
             "To avoid spam, a person will now manually approve your new account. "
             "This is usually quick but sometimes takes a few hours. "
-            "Thank you for contributing!"
+            "Thank you for contributing!",
         )
         return RedirectResponse(url="/login", status_code=302)
     return signup_context
 
 
-def nns(request):
+# === Lists ===
+
+
+# === Workers ===
+# Note that the allowed length of mailto URLs on Chrome/Windows is severely
+# limited.
+def worker_email(
+    worker_name: str,
+    blocker_name: str,
+    message: str,
+    host_url: str,
+    blocked: object,  # noqa: ARG001
+) -> str:
+    owner_name = worker_name.split("-", maxsplit=1)[0]
+    body = f"""\
+Dear {owner_name},
+
+Thank you for contributing to the development of \
+Stockfish. Unfortunately, it seems your Fishtest \
+worker {worker_name} has some issue(s). More \
+specifically the following has been reported:
+
+{message}
+
+You may possibly find more information about this \
+in our event log at {host_url}/actions
+
+Feel free to reply to this email if you require \
+any help, or else contact the #fishtest-dev \
+channel on the Stockfish Discord server: \
+https://discord.com/invite/awnh2qZfTT
+
+Enjoy your day,
+
+{blocker_name} (Fishtest approver)
+
+"""
+    return body  # noqa: RET504
+
+
+def normalize_lf(m: str) -> str:
+    m = m.replace("\r\n", "\n").replace("\r", "\n")
+    return m.rstrip()
+
+
+def _blocked_worker_rows(
+    blocked_workers: list[dict[str, Any]],
+    *,
+    show_email: bool,
+) -> list[dict[str, Any]]:
+    rows = []
+    for worker in blocked_workers:
+        worker_name_value = worker.get("worker_name", "")
+        last_updated = worker.get("last_updated")
+        last_updated_label = (
+            format_time_ago(last_updated) if last_updated is not None else "Never"
+        )
+        actions_url = f"/actions?text={quote(f'"{worker_name_value}"')}"
+        owner_email = worker.get("owner_email", "")
+        subject = worker.get("subject", "")
+        body = worker.get("body", "")
+        mailto_url = ""
+        if show_email and owner_email:
+            body_encoded = quote(body.replace("\n", "\r\n"))
+            mailto_url = (
+                f"mailto:{owner_email}?subject={quote(subject)}&body={body_encoded}"
+            )
+        rows.append(
+            {
+                "worker_name": worker_name_value,
+                "worker_name_key": worker_name_value.lower(),
+                "last_updated": last_updated,
+                "last_updated_label": last_updated_label,
+                "actions_url": actions_url,
+                "owner_email": owner_email,
+                "mailto_url": mailto_url,
+            },
+        )
+    return rows
+
+
+def _filter_blocked_workers(
+    blocked_workers: list[dict[str, Any]],
+    filter_value: str,
+) -> list[dict[str, Any]]:
+    if filter_value == "all-workers":
+        return blocked_workers
+
+    threshold_5d = datetime.now(UTC) - timedelta(days=5)
+    if filter_value == "gt-5days":
+        return [
+            worker
+            for worker in blocked_workers
+            if worker.get("last_updated") and worker["last_updated"] < threshold_5d
+        ]
+
+    # Default to recent workers when an unknown filter is provided.
+    return [
+        worker
+        for worker in blocked_workers
+        if not worker.get("last_updated") or worker["last_updated"] >= threshold_5d
+    ]
+
+
+_WORKERS_FILTER_DEFAULT = "le-5days"
+_WORKERS_FILTER_VALUES = {"all-workers", "le-5days", "gt-5days"}
+_WORKERS_SORT_MAP = {
+    "worker": ("worker_name", False),
+    "last_changed": ("last_updated", True),
+    "events": ("actions_url", False),
+    "email": ("owner_email", False),
+}
+_WORKERS_DEFAULT_SORT = "last_changed"
+_WORKERS_PAGE_SIZE = WORKERS_PAGE_SIZE
+_WORKERS_MAX_ALL = WORKERS_MAX_ALL
+_WORKERS_FILTER_FIELD = "worker_name"
+
+_USER_MANAGEMENT_GROUP_DEFAULT = "pending"
+_USER_MANAGEMENT_GROUP_VALUES = {"all", "pending", "blocked", "idle", "approvers"}
+_USER_MANAGEMENT_SORT_MAP = {
+    "username": ("username", False),
+    "registration": ("registration_time", True),
+    "groups": ("groups_label", False),
+    "email": ("email", False),
+}
+_USER_MANAGEMENT_DEFAULT_SORT = "registration"
+_USER_MANAGEMENT_PAGE_SIZE = USER_MANAGEMENT_PAGE_SIZE
+_USER_MANAGEMENT_MAX_ALL = USER_MANAGEMENT_MAX_ALL
+_USER_MANAGEMENT_FILTER_FIELD = "username"
+
+
+def _workers_query_string(
+    *,
+    filter_value: str,
+    sort_param: str,
+    order_param: str,
+    query_filter: str,
+    view: str,
+) -> str:
+    _, default_reverse = _WORKERS_SORT_MAP[_WORKERS_DEFAULT_SORT]
+    default_order = "desc" if default_reverse else "asc"
+
+    params = []
+    if filter_value != _WORKERS_FILTER_DEFAULT:
+        params.append(("filter", filter_value))
+    if sort_param != _WORKERS_DEFAULT_SORT:
+        params.append(("sort", sort_param))
+    if order_param != default_order:
+        params.append(("order", order_param))
+    if query_filter:
+        params.append(("q", query_filter))
+    if view == "all":
+        params.append(("view", "all"))
+    return _build_query_string(params)
+
+
+def _user_management_query_string(
+    *,
+    group: str,
+    sort_param: str,
+    order_param: str,
+    query_filter: str,
+    view: str,
+) -> str:
+    _, default_reverse = _USER_MANAGEMENT_SORT_MAP[_USER_MANAGEMENT_DEFAULT_SORT]
+    default_order = "desc" if default_reverse else "asc"
+
+    params = []
+    if group != _USER_MANAGEMENT_GROUP_DEFAULT:
+        params.append(("group", group))
+    if sort_param != _USER_MANAGEMENT_DEFAULT_SORT:
+        params.append(("sort", sort_param))
+    if order_param != default_order:
+        params.append(("order", order_param))
+    if query_filter:
+        params.append(("q", query_filter))
+    if view == "all":
+        params.append(("view", "all"))
+    return _build_query_string(params)
+
+
+def _workers_sort_value(row: dict[str, Any], sort_key: str) -> Any:  # noqa: ANN401
+    if sort_key == "last_updated":
+        value = row.get("last_updated")
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0
+    return str(row.get(sort_key, "")).lower()
+
+
+def _user_management_sort_value(row: dict[str, Any], sort_key: str) -> Any:  # noqa: ANN401
+    if sort_key == "registration_time":
+        value = row.get("registration_time")
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0
+    return str(row.get(sort_key, "")).lower()
+
+
+def workers(request: _ViewContext) -> dict[str, Any] | Response:  # noqa: C901, PLR0912, PLR0915
+    is_approver = request.has_permission("approve_run")
+    filter_value = request.params.get("filter", _WORKERS_FILTER_DEFAULT)
+    if filter_value not in _WORKERS_FILTER_VALUES:
+        filter_value = _WORKERS_FILTER_DEFAULT
+
+    sort_param = request.params.get("sort", _WORKERS_DEFAULT_SORT)
+    if sort_param not in _WORKERS_SORT_MAP:
+        sort_param = _WORKERS_DEFAULT_SORT
+    if not is_approver and sort_param == "email":
+        sort_param = _WORKERS_DEFAULT_SORT
+
+    sort_key, default_reverse = _WORKERS_SORT_MAP[sort_param]
+    default_order = "desc" if default_reverse else "asc"
+    order_param = request.params.get("order", default_order)
+    if order_param not in _SORT_ORDER_VALUES:
+        order_param = default_order
+
+    view_param = _normalize_view_mode(request.params.get("view", "paged"))
+
+    query_filter = request.params.get("q", "").strip()
+    page_idx = _page_index_from_params(request.params)
+
+    blocked_workers = request.rundb.workerdb.get_blocked_workers()
+    blocker_name = request.authenticated_userid
+
+    # If we are approver then we are logged in, so blocker_name is not None
+    if is_approver:
+        for w in blocked_workers:
+            owner_name = w["worker_name"].split("-")[0]
+            owner = request.userdb.get_user(owner_name)
+            w["owner_email"] = owner["email"] if owner is not None else ""
+            w["body"] = worker_email(
+                w["worker_name"],
+                blocker_name,  # type: ignore[invalid-argument-type]
+                w["message"],
+                _host_url(request),
+                w["blocked"],
+            )
+            w["subject"] = f"Issue(s) with worker {w['worker_name']}"
+
+    worker_name = request.matchdict.get("worker_name")
+    show_admin = False
+    admin_context = {}
+
+    try:
+        validate(union(short_worker_name, "show"), worker_name, name="worker_name")
+    except ValidationError as e:
+        request.session.flash(str(e), "error")
+    else:
+        if len(worker_name.split("-")) != _WORKER_NAME_PARTS:  # type: ignore[unresolved-attribute]
+            pass  # fall through to shared rendering
+        else:
+            result = ensure_logged_in(request)
+            if isinstance(result, RedirectResponse):
+                return result
+            owner_name = worker_name.split("-")[0]  # type: ignore[unresolved-attribute]
+            if not is_approver and blocker_name != owner_name:
+                request.session.flash(
+                    "Only owners and approvers can block/unblock",
+                    "error",
+                )
+            elif request.method == "POST":
+                button = request.POST.get("submit")
+                if button == "Submit":
+                    blocked = request.POST.get("blocked") is not None
+                    message = request.POST.get("message")
+                    max_chars = 500
+                    if len(message) > max_chars:  # type: ignore[invalid-argument-type]
+                        request.session.flash(
+                            "Warning: your description of the"
+                            " issue has been truncated to"
+                            f" {max_chars} characters",
+                            "error",
+                        )
+                        message = message[:max_chars]  # type: ignore[not-subscriptable]
+                    message = normalize_lf(message)  # type: ignore[invalid-argument-type]
+                    was_blocked = request.workerdb.get_worker(worker_name)["blocked"]
+                    request.rundb.workerdb.update_worker(
+                        worker_name,
+                        blocked=blocked,
+                        message=message,
+                    )
+                    if blocked != was_blocked:
+                        request.session.flash(
+                            f"Worker {worker_name}"
+                            f" {'blocked' if blocked else 'unblocked'}!",
+                        )
+                        request.actiondb.block_worker(
+                            username=blocker_name,
+                            worker=worker_name,
+                            message="blocked" if blocked else "unblocked",
+                        )
+                return RedirectResponse(url="/workers/show", status_code=302)
+            else:
+                w = request.rundb.workerdb.get_worker(worker_name)
+                show_admin = True
+                admin_context = {
+                    "worker_name": worker_name,
+                    "blocked": w["blocked"],
+                    "message": w["message"],
+                    "last_updated_label": (
+                        format_time_ago(w["last_updated"])
+                        if w["last_updated"]
+                        else "Never"
+                    ),
+                }
+
+    # --- shared rendering for all non-redirect branches ---
+    filtered_rows = _blocked_worker_rows(
+        _filter_blocked_workers(blocked_workers, filter_value),
+        show_email=is_approver,
+    )
+
+    if query_filter:
+        query_folded = query_filter.casefold()
+        filtered_rows = [
+            row
+            for row in filtered_rows
+            if query_folded in str(row.get(_WORKERS_FILTER_FIELD, "")).casefold()
+        ]
+
+    filtered_rows.sort(
+        key=lambda row: (
+            _workers_sort_value(row, sort_key),
+            row.get("worker_name_key", ""),
+        ),
+        reverse=(order_param == "desc"),
+    )
+
+    num_workers = len(filtered_rows)
+    is_truncated = False
+    if view_param == "all":
+        if len(filtered_rows) > _WORKERS_MAX_ALL:
+            filtered_rows = filtered_rows[:_WORKERS_MAX_ALL]
+            is_truncated = True
+    else:
+        start = page_idx * _WORKERS_PAGE_SIZE
+        filtered_rows = filtered_rows[start : start + _WORKERS_PAGE_SIZE]
+
+    query_params = _workers_query_string(
+        filter_value=filter_value,
+        sort_param=sort_param,
+        order_param=order_param,
+        query_filter=query_filter,
+        view=view_param,
+    )
+    pages = (
+        pagination(page_idx, num_workers, _WORKERS_PAGE_SIZE, query_params)
+        if view_param == "paged"
+        else []
+    )
+
+    context = {
+        "show_admin": show_admin,
+        "show_email": is_approver,
+        "blocked_workers": filtered_rows,
+        "filter_value": filter_value,
+        "sort": sort_param,
+        "order": order_param,
+        "q": query_filter,
+        "view": view_param,
+        "pages": pages,
+        "num_workers": num_workers,
+        "max_all": _WORKERS_MAX_ALL,
+        "is_truncated": is_truncated,
+        **admin_context,
+    }
+
+    return _render_hx_or_context(
+        request,
+        "workers_content_fragment.html.j2",
+        context,
+        extra_context={"is_hx": True},
+    )
+
+
+# === Neural Networks ===
+def upload(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C901, PLR0911, PLR0912, PLR0915
+    result = ensure_logged_in(request)
+    if isinstance(result, RedirectResponse):
+        return result
+    base_context = {
+        "upload_url": str(request.url),
+        "testing_guidelines_url": "https://github.com/official-stockfish/fishtest/wiki/Creating-my-first-test",
+        "cc0_url": "https://creativecommons.org/share-your-work/public-domain/cc0/",
+        "nn_stats_url": "/nns",
+    }
+
+    if request.method != "POST":
+        return base_context
+    try:
+        filename = request.POST["network"].filename
+        input_file = request.POST["network"].file
+        network = input_file.read()
+    except AttributeError:
+        request.session.flash(
+            "Specify a network file with the 'Choose File' button",
+            "error",
+        )
+        return base_context
+    except Exception:
+        logger.exception("Error reading the network file")
+        request.session.flash("Error reading the network file", "error")
+        return base_context
+    if request.rundb.get_nn(filename):
+        request.session.flash(f"Network {filename} already exists", "error")
+        return base_context
+    errors = []
+    if len(network) >= _MAX_NETWORK_SIZE_BYTES:
+        errors.append("Network must be < 200MB")
+    if not re.match(r"^nn-[0-9a-f]{12}\.nnue$", filename):
+        errors.append('Name must match "nn-[SHA256 first 12 digits].nnue"')
+    net_hash = hashlib.sha256(network).hexdigest()
+    if net_hash[:12] != filename[3:15]:
+        errors.append(f"Wrong SHA256 hash: {net_hash[:12]} Filename: {filename[3:15]}")
+    if errors:
+        for error in errors:
+            request.session.flash(error, "error")
+        return base_context
+    net_file_gz = Path("/var/www/fishtest/nn") / f"{filename}.gz"
+    try:
+        with gzip.open(net_file_gz, "xb") as f:
+            f.write(network)
+    except FileExistsError:
+        logger.exception("Network %s already uploaded", filename)
+        request.session.flash(f"Network {filename} already uploaded", "error")
+        return base_context
+    except Exception:
+        net_file_gz.unlink(missing_ok=True)
+        logger.exception("Failed to write network %s", filename)
+        request.session.flash(f"Failed to write network {filename}", "error")
+        return base_context
+    try:
+        net_data = gzip.decompress(net_file_gz.read_bytes())
+    except Exception:
+        net_file_gz.unlink()
+        logger.exception("Failed to read uploaded network %s", filename)
+        request.session.flash(f"Failed to read uploaded network {filename}", "error")
+        return base_context
+
+    net_hash = hashlib.sha256(net_data).hexdigest()
+    if net_hash[:12] != filename[3:15]:
+        net_file_gz.unlink()
+        request.session.flash(f"Invalid hash for uploaded network {filename}", "error")
+        return base_context
+
+    if request.rundb.get_nn(filename):
+        request.session.flash(f"Network {filename} already exists", "error")
+        return base_context
+
+    request.rundb.upload_nn(request.authenticated_userid, filename)
+
+    request.actiondb.upload_nn(
+        username=request.authenticated_userid,
+        nn=filename,
+    )
+
+    return RedirectResponse(url="/nns", status_code=302)
+
+
+def nns(request: _ViewContext) -> dict[str, Any] | Response:  # noqa: C901, PLR0912, PLR0915
     user = request.params.get("user", "")
     network_name = request.params.get("network_name", "")
-    master_only = request.params.get("master_only", False)
+    sort_param = request.params.get("sort", "time")
+    if sort_param not in {
+        "time",
+        "name",
+        "user",
+        "first_test",
+        "last_test",
+        "downloads",
+    }:
+        sort_param = "time"
+    order_param = request.params.get("order", "desc")
+    if order_param not in {"asc", "desc"}:
+        order_param = "desc"
+    view_param = request.params.get("view", "paged")
+    if view_param not in {"paged", "all"}:
+        view_param = "paged"
 
+    page_size = NNS_PAGE_SIZE
+    max_all = NNS_MAX_ALL
+
+    def _truthy(value: Any) -> bool:  # noqa: ANN401
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "on", "yes"}
+
+    master_only_param = request.params.get("master_only")
+    if master_only_param is None:
+        master_only = _truthy(request.cookies.get("master_only", "false"))
+    else:
+        master_only = _truthy(master_only_param)
+
+    page_idx = 0
     page_param = request.params.get("page", "")
-    page_idx = max(0, int(page_param) - 1) if page_param.isdigit() else 0
-    page_size = 25
+    if view_param == "paged":
+        page_idx = max(0, int(page_param) - 1) if page_param.isdigit() else 0
 
     nns, num_nns = request.rundb.get_nns(
         user=user,
         network_name=network_name,
         master_only=master_only,
-        limit=page_size,
-        skip=page_idx * page_size,
+        limit=0,
+        skip=0,
     )
+    nns = list(nns)
+    nns_summary = {
+        "nets": num_nns,
+        "master_nets": sum(1 for nn in nns if nn.get("is_master")),
+        "contributors": len({nn.get("user") for nn in nns if nn.get("user")}),
+        "downloads": sum(int(nn.get("downloads", 0)) for nn in nns),
+    }
+
+    def _first_test_date(nn: dict[str, Any]) -> datetime:
+        return (nn.get("first_test") or {}).get("date") or datetime.min.replace(
+            tzinfo=UTC,
+        )
+
+    def _last_test_date(nn: dict[str, Any]) -> datetime:
+        return (nn.get("last_test") or {}).get("date") or datetime.min.replace(
+            tzinfo=UTC,
+        )
+
+    def _sort_key(nn: dict[str, Any]) -> tuple[object, str]:
+        key_map = {
+            "time": nn.get("time") or datetime.min.replace(tzinfo=UTC),
+            "name": nn.get("name", "").lower(),
+            "user": nn.get("user", "").lower(),
+            "first_test": _first_test_date(nn),
+            "last_test": _last_test_date(nn),
+            "downloads": int(nn.get("downloads", 0)),
+        }
+        # Deterministic tie-break to avoid row jitter between requests.
+        return (key_map[sort_param], nn.get("name", "").lower())
+
+    nns.sort(key=_sort_key, reverse=(order_param == "desc"))
+
+    if view_param == "paged":
+        start = page_idx * page_size
+        nns = nns[start : start + page_size]
+
+    is_truncated = False
+    if view_param == "all" and len(nns) > max_all:
+        nns = nns[:max_all]
+        is_truncated = True
 
     formatted_nns = []
     for nn in nns:
@@ -796,23 +1291,38 @@ def nns(request):
                 ),
                 "last_test_label": last_test_label,
                 "last_test_url": f"/tests/view/{last_test_id}" if last_test_id else "",
-            }
+            },
         )
 
-    query_params = ""
+    query_dict = {
+        "view": view_param,
+        "sort": sort_param,
+        "order": order_param,
+    }
     if user:
-        query_params += "&user={}".format(user)
+        query_dict["user"] = user
     if network_name:
-        query_params += "&network_name={}".format(network_name)
+        query_dict["network_name"] = network_name
     if master_only:
-        query_params += "&master_only={}".format(master_only)
+        query_dict["master_only"] = "1"
 
-    pages = pagination(page_idx, num_nns, page_size, query_params)
+    query_params = "&" + urlencode(query_dict)
 
-    return {
+    pages = []
+    if view_param == "paged":
+        pages = pagination(page_idx, num_nns, page_size, query_params)
+
+    context = {
         "nns": formatted_nns,
+        "nns_summary": nns_summary,
         "pages": pages,
-        "master_only": request.cookies.get("master_only") == "true",
+        "master_only": master_only,
+        "view": view_param,
+        "sort": sort_param,
+        "order": order_param,
+        "num_nns": num_nns,
+        "max_all": max_all,
+        "is_truncated": is_truncated,
         "filters": {
             "network_name": network_name,
             "user": user,
@@ -820,219 +1330,82 @@ def nns(request):
         },
         "network_name_filter": network_name,
         "user_filter": user,
+        "cookie_max_age": PERSISTENT_UI_COOKIE_MAX_AGE_SECONDS,
     }
 
-
-def sprt_calc(request):
-    return {}
-
-
-def rate_limits(request):
-    return {}
-
-
-# Different LOCALES may have different quotation marks.
-# See https://op.europa.eu/en/web/eu-vocabularies/formex/physical-specifications/character-encoding/quotation-marks
-
-quotation_marks = (
-    0x0022,
-    0x0027,
-    0x00AB,
-    0x00BB,
-    0x2018,
-    0x2019,
-    0x201A,
-    0x201B,
-    0x201C,
-    0x201D,
-    0x201E,
-    0x201F,
-    0x2039,
-    0x203A,
-)
-
-quotation_marks = "".join(chr(c) for c in quotation_marks)
-quotation_marks_translation = str.maketrans(quotation_marks, len(quotation_marks) * '"')
-
-
-def sanitize_quotation_marks(text):
-    return text.translate(quotation_marks_translation)
-
-
-# === Actions log ===
-def actions(request):
-    DEFAULT_MAX_ACTIONS_AUTH = 50000
-    HARD_MAX_ACTIONS_ANON = 5000
-
-    is_authenticated = request.authenticated_userid is not None
-
-    search_action = request.params.get("action", "")
-    username = request.params.get("user", "")
-    text = sanitize_quotation_marks(request.params.get("text", ""))
-    before = request.params.get("before", None)
-    max_actions_param = request.params.get("max_actions", None)
-    max_actions = None
-    run_id = request.params.get("run_id", "")
-
-    if before:
-        before = float(before)
-    if max_actions_param:
-        try:
-            max_actions = int(max_actions_param)
-        except ValueError:
-            max_actions = None
-        if max_actions is not None and max_actions <= 0:
-            max_actions = None
-
-    if not is_authenticated:
-        max_actions = HARD_MAX_ACTIONS_ANON if max_actions is None else max_actions
-        max_actions = min(max_actions, HARD_MAX_ACTIONS_ANON)
-    elif max_actions is None and not (username or search_action or text or run_id):
-        # Default cap for unfiltered /actions.
-        max_actions = DEFAULT_MAX_ACTIONS_AUTH
-
-    page_param = request.params.get("page", "")
-    page_idx = max(0, int(page_param) - 1) if page_param.isdigit() else 0
-    page_size = 25
-
-    actions, num_actions = request.actiondb.get_actions(
-        username=username,
-        action=search_action,
-        text=text,
-        skip=page_idx * page_size,
-        limit=page_size,
-        utc_before=before,
-        max_actions=max_actions,
-        run_id=run_id,
+    return (
+        _render_hx_fragment(request, "nns_content_fragment.html.j2", context) or context
     )
-    actions = list(actions)
 
-    for action in actions:
-        action.setdefault("action", "")
-        action.setdefault("username", "")
-        time_value = action.get("time")
-        if time_value is None:
-            time_label = ""
-        else:
-            time_label = datetime.fromtimestamp(float(time_value), UTC).strftime(
-                "%y-%m-%d %H:%M:%S"
+
+def sprt_calc(request: _ViewContext) -> dict[str, Any]:  # noqa: ARG001
+    return {}
+
+
+def _build_rate_limits_context() -> dict[str, Any]:
+    server_rate_limit = -1
+    server_reset = "00:00:00"
+
+    try:
+        rate_limit = gh.rate_limit()
+        server_rate_limit = int(rate_limit.get("remaining", -1))
+        reset_timestamp = float(rate_limit.get("reset", 0))
+        if reset_timestamp > 0:
+            server_reset = datetime.fromtimestamp(reset_timestamp, UTC).strftime(
+                "%H:%M:%S",
             )
-            time_label = time_label.replace("-", "\u2011", 2)
-
-        time_query = {
-            "max_actions": "1",
-            "action": search_action,
-            "user": username,
-            "text": text,
-            "before": time_value or "",
-            "run_id": run_id,
-        }
-        time_url = "/actions?" + urlencode(time_query)
-
-        agent_name = ""
-        agent_url = ""
-        if "worker" in action and action.get("action") != "block_worker":
-            agent_name = action.get("worker", "")
-            agent_short = "-".join(agent_name.split("-")[0:3]) if agent_name else ""
-            agent_url = f"/workers/{agent_short}" if agent_short else ""
-        else:
-            agent_name = action.get("username", "")
-            agent_url = f"/user/{agent_name}" if agent_name else ""
-
-        if action.get("action") in ("system_event", "log_message"):
-            agent_url = ""
-            if "worker" in action:
-                agent_name = action.get("worker", agent_name)
-
-        target_name = ""
-        target_url = ""
-        if "nn" in action:
-            raw_name = action.get("nn", "")
-            target_name = raw_name.replace("-", "\u2011") if raw_name else ""
-            target_url = f"/api/nn/{raw_name}" if raw_name else ""
-        elif "run" in action and "run_id" in action:
-            target_name = action.get("run", "")
-            task_id = action.get("task_id")
-            task_suffix = f"/{task_id}" if task_id is not None else ""
-            target_name = f"{target_name}{task_suffix}" if target_name else ""
-            task_query = f"?show_task={task_id}" if task_id is not None else ""
-            target_url = f"/tests/view/{action.get('run_id')}{task_query}"
-        elif request.has_permission("approve_run") and "user" in action:
-            target_name = action.get("user", "")
-            target_url = f"/user/{target_name}" if target_name else ""
-        elif action.get("action") == "block_worker" and "worker" in action:
-            target_name = action.get("worker", "")
-            target_url = f"/workers/{target_name}" if target_name else ""
-        else:
-            target_name = action.get("user", "")
-
-        action.update(
-            {
-                "time_label": time_label,
-                "time_url": time_url,
-                "event": action.get("action", ""),
-                "agent_name": agent_name,
-                "agent_url": agent_url or None,
-                "target_name": target_name,
-                "target_url": target_url or None,
-                "message": action.get("message", ""),
-            }
-        )
-
-    # If the requested page is out of range, redirect to the last page.
-    if num_actions > 0:
-        last_page = (num_actions - 1) // page_size + 1
-        if page_param.isdigit() and int(page_param) > last_page:
-            redirect_query = dict(request.params)
-            redirect_query["page"] = str(last_page)
-            if max_actions is not None:
-                redirect_query["max_actions"] = str(max_actions)
-            return RedirectResponse(
-                url=_path_url(request) + "?" + urlencode(redirect_query),
-                status_code=302,
-            )
-
-    query_params = ""
-    if username:
-        query_params += "&user={}".format(username)
-    if search_action:
-        query_params += "&action={}".format(search_action)
-    if text:
-        query_params += "&text={}".format(text)
-    if max_actions:
-        query_params += "&max_actions={}".format(max_actions)
-    if before:
-        query_params += "&before={}".format(before)
-    if run_id:
-        query_params += "&run_id={}".format(run_id)
-
-    pages = pagination(page_idx, num_actions, page_size, query_params)
+    except Exception:  # noqa: BLE001, S110
+        # Keep default placeholder values when GitHub is unavailable.
+        pass
 
     return {
-        "actions": actions,
-        "pages": pages,
-        "filters": {
-            "action": search_action,
-            "username": username,
-            "text": text,
-            "run_id": run_id,
-        },
-        "usernames": [user["username"] for user in request.userdb.get_users()],
+        "server_rate_limit": server_rate_limit,
+        "server_reset": server_reset,
     }
 
 
-# === User management + profiles ===
-def get_idle_users(users, request):
+def rate_limits(request: _ViewContext) -> dict[str, Any]:  # noqa: ARG001
+    return _build_rate_limits_context()
+
+
+def rate_limits_server(request: _ViewContext) -> Response:  # noqa: ARG001
+    context = _build_rate_limits_context()
+    server_rate_limit = context["server_rate_limit"]
+    server_reset = context["server_reset"]
+    return HTMLResponse(
+        f'{server_rate_limit}<span id="server_reset" hx-swap-oob="innerHTML">'
+        f"{server_reset}</span>",
+    )
+
+
+def user_management_pending_count(request: _ViewContext) -> dict[str, Any]:  # noqa: ARG001
+    return {}
+
+
+def actions(request: _ViewContext) -> dict[str, Any] | RedirectResponse | Response:
+    result = _actions_impl(request, page_size=ACTIONS_PAGE_SIZE)
+    if isinstance(result, RedirectResponse):
+        return result
+    return (
+        _render_hx_fragment(request, "actions_content_fragment.html.j2", result)
+        or result
+    )
+
+
+# === Users ===
+def get_idle_users(
+    users: list[dict[str, Any]],
+    request: _ViewContext,
+) -> list[dict[str, Any]]:
     idle = {}
     for u in users:
         idle[u["username"]] = u
     for u in request.userdb.user_cache.find():
         del idle[u["username"]]
-    idle = list(idle.values())
-    return idle
+    return list(idle.values())
 
 
-def _user_management_rows(users):
+def _user_management_rows(users: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for user in users:
         username = user.get("username", "")
@@ -1047,39 +1420,137 @@ def _user_management_rows(users):
             {
                 "username": username,
                 "user_url": f"/user/{username}" if username else "",
+                "username_key": username.lower(),
+                "registration_time": registration_time,
                 "registration_label": registration_label,
                 "groups": groups,
                 "groups_label": format_group(groups),
                 "email": user.get("email", ""),
-            }
+            },
         )
     return rows
 
 
-def user_management(request):
+def user_management(request: _ViewContext) -> dict[str, Any] | Response:  # noqa: C901
     if not request.has_permission("approve_run"):
         request.session.flash("You cannot view user management", "error")
         return home(request)
+
+    group = request.params.get("group", _USER_MANAGEMENT_GROUP_DEFAULT)
+    if group not in _USER_MANAGEMENT_GROUP_VALUES:
+        group = _USER_MANAGEMENT_GROUP_DEFAULT
+
+    sort_param = request.params.get("sort", _USER_MANAGEMENT_DEFAULT_SORT)
+    if sort_param not in _USER_MANAGEMENT_SORT_MAP:
+        sort_param = _USER_MANAGEMENT_DEFAULT_SORT
+
+    sort_key, default_reverse = _USER_MANAGEMENT_SORT_MAP[sort_param]
+    order_param, _ = _normalize_sort_order(
+        request.params.get("order", ""),
+        default_reverse=default_reverse,
+    )
+
+    view_param = _normalize_view_mode(request.params.get("view", "paged"))
+
+    query_filter = request.params.get("q", "").strip()
+    page_idx = _page_index_from_params(request.params)
 
     users = list(request.userdb.get_users())
     pending_users = request.userdb.get_pending()
     blocked_users = request.userdb.get_blocked()
     idle_users = get_idle_users(users, request)
 
-    return {
-        "all_users": _user_management_rows(users),
-        "pending_users": _user_management_rows(pending_users),
-        "blocked_users": _user_management_rows(blocked_users),
-        "approvers_users": [
+    all_count = len(users)
+    pending_count = len(pending_users)
+    blocked_count = len(blocked_users)
+    idle_count = len(idle_users)
+
+    if group == "all":
+        selected_rows = _user_management_rows(users)
+    elif group == "pending":
+        selected_rows = _user_management_rows(pending_users)
+    elif group == "blocked":
+        selected_rows = _user_management_rows(blocked_users)
+    elif group == "idle":
+        selected_rows = _user_management_rows(idle_users)
+    else:
+        selected_rows = [
             user
             for user in _user_management_rows(users)
             if "group:approvers" in user.get("groups", [])
-        ],
-        "idle_users": _user_management_rows(idle_users),  # depends on cache too
+        ]
+
+    if query_filter:
+        query_folded = query_filter.casefold()
+        selected_rows = [
+            row
+            for row in selected_rows
+            if query_folded
+            in str(row.get(_USER_MANAGEMENT_FILTER_FIELD, "")).casefold()
+        ]
+
+    selected_rows.sort(
+        key=lambda row: (
+            _user_management_sort_value(row, sort_key),
+            row.get("username_key", ""),
+        ),
+        reverse=(order_param == "desc"),
+    )
+
+    num_selected = len(selected_rows)
+    is_truncated = False
+    if view_param == "all":
+        if len(selected_rows) > _USER_MANAGEMENT_MAX_ALL:
+            selected_rows = selected_rows[:_USER_MANAGEMENT_MAX_ALL]
+            is_truncated = True
+    else:
+        start = page_idx * _USER_MANAGEMENT_PAGE_SIZE
+        selected_rows = selected_rows[start : start + _USER_MANAGEMENT_PAGE_SIZE]
+
+    query_params = _user_management_query_string(
+        group=group,
+        sort_param=sort_param,
+        order_param=order_param,
+        query_filter=query_filter,
+        view=view_param,
+    )
+    pages = (
+        pagination(page_idx, num_selected, _USER_MANAGEMENT_PAGE_SIZE, query_params)
+        if view_param == "paged"
+        else []
+    )
+
+    approvers_count = len(
+        [user for user in users if "group:approvers" in user.get("groups", [])],
+    )
+
+    context = {
+        "all_count": all_count,
+        "pending_count": pending_count,
+        "blocked_count": blocked_count,
+        "idle_count": idle_count,
+        "approvers_count": approvers_count,
+        "group": group,
+        "selected_users": selected_rows,
+        "sort": sort_param,
+        "order": order_param,
+        "q": query_filter,
+        "view": view_param,
+        "pages": pages,
+        "num_selected_users": num_selected,
+        "max_all": _USER_MANAGEMENT_MAX_ALL,
+        "is_truncated": is_truncated,
     }
 
+    return _render_hx_or_context(
+        request,
+        "user_management_content_fragment.html.j2",
+        context,
+        extra_context={"is_hx": True},
+    )
 
-def user(request):
+
+def user(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C901, PLR0911, PLR0912, PLR0915
     userid = ensure_logged_in(request)
     if isinstance(userid, RedirectResponse):
         return userid
@@ -1122,7 +1593,8 @@ def user(request):
                         return home(request)
                 else:
                     request.session.flash(
-                        "Error! Matching verify password required", "error"
+                        "Error! Matching verify password required",
+                        "error",
                     )
                     return home(request)
 
@@ -1130,7 +1602,8 @@ def user(request):
                 validate(union(github_repo, ""), tests_repo, "tests_repo")
             except ValidationError as e:
                 request.session.flash(
-                    f"Error! Invalid test repo {tests_repo}: {str(e)}", "error"
+                    f"Error! Invalid test repo {tests_repo}: {e!s}",
+                    "error",
                 )
                 return home(request)
 
@@ -1140,19 +1613,19 @@ def user(request):
                 email_is_valid, validated_email = email_valid(new_email)
                 if not email_is_valid:
                     request.session.flash(
-                        "Error! Invalid email: " + validated_email, "error"
+                        "Error! Invalid email: " + validated_email,
+                        "error",
                     )
                     return home(request)
-                else:
-                    user_data["email"] = validated_email
-                    request.session.flash("Success! Email updated")
+                user_data["email"] = validated_email
+                request.session.flash("Success! Email updated")
             request.userdb.save_user(user_data)
         elif "blocked" in request.POST and request.POST["blocked"].isdigit():
             user_data["blocked"] = bool(int(request.POST["blocked"]))
             request.session.flash(
                 ("Blocked" if user_data["blocked"] else "Unblocked")
                 + " user "
-                + user_name
+                + user_name,
             )
             request.userdb.clear_cache()
             request.userdb.save_user(user_data)
@@ -1183,7 +1656,7 @@ def user(request):
     if user_data["tests_repo"] != "":
         try:
             user, repo = gh.parse_repo(user_data["tests_repo"])
-        except Exception:
+        except Exception:  # noqa: BLE001
             safe_tests_repo_url = ""
             extract_repo_from_link = ""
         else:
@@ -1208,605 +1681,528 @@ def user(request):
     }
 
 
-# === Contributors views ===
-def contributors(request):
-    users_list = list(request.userdb.user_cache.find())
-    users_list.sort(key=lambda k: k["cpu_hours"], reverse=True)
-    is_approver = request.has_permission("approve_run")
-    return {
-        "is_monthly": False,
-        "monthly_suffix": "",
-        "summary": build_contributors_summary(users_list),
-        "users": build_contributors_rows(users_list, is_approver=is_approver),
-        "is_approver": is_approver,
-    }
+# === Contributors ===
+_CONTRIBUTORS_SORT_MAP = {
+    "cpu_hours": ("cpu_hours", True),
+    "username": ("username", False),
+    "last_updated": ("last_updated", True),
+    "games_per_hour": ("games_per_hour", True),
+    "games": ("games", True),
+    "tests": ("tests", True),
+    "tests_repo": ("tests_repo", False),
+}
+_CONTRIBUTORS_DEFAULT_SORT = "cpu_hours"
+_CONTRIBUTORS_PAGE_SIZE = CONTRIBUTORS_PAGE_SIZE
+_CONTRIBUTORS_MAX_ALL = CONTRIBUTORS_MAX_ALL
 
 
-def contributors_monthly(request):
-    users_list = list(request.userdb.top_month.find())
-    users_list.sort(key=lambda k: k["cpu_hours"], reverse=True)
-    is_approver = request.has_permission("approve_run")
-    return {
-        "is_monthly": True,
-        "monthly_suffix": " - Top Month",
-        "summary": build_contributors_summary(users_list),
-        "users": build_contributors_rows(users_list, is_approver=is_approver),
-        "is_approver": is_approver,
-    }
-
-
-# === Run creation helpers ===
-
-
-def get_master_info(
-    user="official-stockfish", repo="Stockfish", ignore_rate_limit=False
-):
-    # Contract: always return a dict with stable keys so templates/callers do
-    # not crash when GitHub is transiently unavailable.
-    default_info = {"bench": None, "message": "", "date": ""}
-
+def _contributors_sort_value(user: dict[str, Any], sort_key: str) -> Any:  # noqa: ANN401
+    if sort_key == "username":
+        return str(user.get("username", "")).lower()
+    if sort_key == "tests_repo":
+        return str(user.get("tests_repo", "")).lower()
+    if sort_key == "last_updated":
+        value = user.get("last_updated")
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0
     try:
-        commits = gh.get_commits(
-            user=user, repo=repo, ignore_rate_limit=ignore_rate_limit
-        )
-    except Exception as e:
-        # Most common production failure: ConnectionError/RemoteDisconnected.
-        print(f"Exception getting commits:\n{e}", flush=True)
-        return default_info
-
-    if not isinstance(commits, list) or not commits:
-        # GitHub can occasionally return an unexpected JSON shape.
-        print(
-            "Unexpected GitHub commits payload; expected non-empty list.",
-            flush=True,
-        )
-        return default_info
-
-    bench_search = re.compile(r"(^|\s)[Bb]ench[ :]+([1-9]\d{5,7})(?!\d)")
-    latest_bench_match = None
-
-    try:
-        message = commits[0]["commit"]["message"].strip().split("\n")[0].strip()
-        date_str = commits[0]["commit"]["committer"]["date"]
-        date = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-    except Exception as e:
-        print(f"Unexpected commit payload shape: {e}", flush=True)
-        return default_info
-
-    for commit in commits:
-        try:
-            raw_message = commit["commit"]["message"]
-        except KeyError, TypeError:
-            # Be tolerant to partial payload corruption in later entries.
-            continue
-        if not isinstance(raw_message, str):
-            continue
-
-        message_lines = raw_message.strip().split("\n")
-        for line in reversed(message_lines):
-            bench = bench_search.search(line.strip())
-            if bench:
-                latest_bench_match = {
-                    "bench": bench.group(2),
-                    "message": message,
-                    "date": date.strftime("%b %d"),
-                }
-                break
-        if latest_bench_match:
-            break
-
-    if latest_bench_match is None:
-        # Keep message/date for PT info text, but leave bench unset.
-        return {"bench": None, "message": message, "date": date.strftime("%b %d")}
-
-    return latest_bench_match
+        return int(user.get(sort_key, 0))
+    except TypeError, ValueError:
+        return 0
 
 
-def get_sha(branch, repo_url):
-    """Resolves the git branch to sha commit"""
-    user, repo = gh.parse_repo(repo_url)
-    try:
-        commit = gh.get_commit(user=user, repo=repo, branch=branch)
-    except Exception as e:
-        raise Exception(f"Unable to access developer repository {repo_url}: {str(e)}")
+def _contributors_common(  # noqa: C901, PLR0912, PLR0915
+    request: _ViewContext,
+    *,
+    collection: Any,  # noqa: ANN401
+    is_monthly: bool,
+) -> dict[str, Any] | RedirectResponse | Response:
+    page_idx = _page_index_from_params(request.params)
 
-    if not isinstance(commit, dict):
-        return "", ""
+    search = request.params.get("search", "").strip()
+    sort_param = request.params.get("sort", "").strip().lower()
+    order_param = request.params.get("order", "").strip().lower()
+    view_param = request.params.get("view", "").strip().lower()
+    highlight = request.params.get("highlight", "").strip()
 
-    sha = commit.get("sha")
-    if not isinstance(sha, str) or sha == "":
-        return "", ""
+    if sort_param not in _CONTRIBUTORS_SORT_MAP:
+        sort_param = _CONTRIBUTORS_DEFAULT_SORT
+    sort_key, default_reverse = _CONTRIBUTORS_SORT_MAP[sort_param]
 
-    message = ""
-    commit_data = commit.get("commit")
-    if isinstance(commit_data, dict):
-        raw_message = commit_data.get("message", "")
-        if isinstance(raw_message, str):
-            message = raw_message.split("\n", 1)[0]
-
-    return sha, message
-
-
-def get_nets(commit_sha, repo_url):
-    """Get the nets from evaluate.h or ucioption.cpp in the repo"""
-    try:
-        nets = []
-        pattern = re.compile("nn-[a-f0-9]{12}.nnue")
-
-        user, repo = gh.parse_repo(repo_url)
-        options = gh.download_from_github(
-            "/src/evaluate.h", user=user, repo=repo, branch=commit_sha, method="raw"
-        ).decode()
-        for line in options.splitlines():
-            if "EvalFileDefaultName" in line and "define" in line:
-                m = pattern.search(line)
-                if m:
-                    net = m.group(0)
-                    if net not in nets:
-                        nets.append(net)
-
-        if nets:
-            return nets
-
-        options = gh.download_from_github(
-            "/src/ucioption.cpp", user=user, repo=repo, branch=commit_sha, method="raw"
-        ).decode()
-        for line in options.splitlines():
-            if "EvalFile" in line and "Option" in line:
-                m = pattern.search(line)
-                if m:
-                    net = m.group(0)
-                    if net not in nets:
-                        nets.append(net)
-        return nets
-    except Exception as e:
-        raise Exception(f"Unable to access developer repository {repo_url}: {str(e)}")
-
-
-def parse_spsa_params(spsa):
-    raw = spsa["raw_params"]
-    params = []
-    for line in raw.split("\n"):
-        chunks = line.strip().split(",")
-        if len(chunks) == 1 and chunks[0] == "":  # blank line
-            continue
-        if len(chunks) != 6:
-            raise Exception("the line {} does not have 6 entries".format(chunks))
-        param = {
-            "name": chunks[0],
-            "start": float(chunks[1]),
-            "min": float(chunks[2]),
-            "max": float(chunks[3]),
-            "c_end": float(chunks[4]),
-            "r_end": float(chunks[5]),
-        }
-        param["c"] = param["c_end"] * spsa["num_iter"] ** spsa["gamma"]
-        param["a_end"] = param["r_end"] * param["c_end"] ** 2
-        param["a"] = param["a_end"] * (spsa["A"] + spsa["num_iter"]) ** spsa["alpha"]
-        param["theta"] = param["start"]
-        params.append(param)
-    return params
-
-
-def validate_modify(request, run):
-    """Return None on success, or a RedirectResponse on validation failure."""
-    now = datetime.now(UTC)
-    if "start_time" not in run or (now - run["start_time"]).days > 30:
-        request.session.flash("Run too old to be modified", "error")
-        return home(request)
-
-    if "num-games" not in request.POST:
-        request.session.flash("Unable to modify with no number of games!", "error")
-        return home(request)
-
-    bad_values = not all(
-        value is not None and value.replace("-", "").isdigit()
-        for value in [
-            request.POST["priority"],
-            request.POST["num-games"],
-            request.POST["throughput"],
-        ]
+    order_param, reverse = _normalize_sort_order(
+        order_param,
+        default_reverse=default_reverse,
     )
 
-    if bad_values:
-        request.session.flash("Bad values!", "error")
-        return home(request)
+    view_param = _normalize_view_mode(view_param)
 
-    num_games = int(request.POST["num-games"])
-    if (
-        num_games > run["args"]["num_games"]
-        and "sprt" not in run["args"]
-        and "spsa" not in run["args"]
-    ):
-        request.session.flash(
-            "Unable to modify number of games in a fixed game test!", "error"
-        )
-        return home(request)
+    all_users_unfiltered = list(collection.find())
+    users_list = list(all_users_unfiltered)
 
-    if "spsa" in run["args"] and num_games != run["args"]["num_games"]:
-        request.session.flash(
-            "Unable to modify number of games for SPSA tests, SPSA hyperparams are based off the initial number of games",
-            "error",
-        )
-        return home(request)
+    # Stable two-pass sort: enforce username asc tie-breaker, then primary key.
+    users_list.sort(key=lambda u: str(u.get("username", "")).lower())
+    users_list.sort(
+        key=lambda u: _contributors_sort_value(u, sort_key),
+        reverse=reverse,
+    )
 
-    max_games = 3200000
-    if num_games > max_games:
-        request.session.flash("Number of games must be <= " + str(max_games), "error")
-        return home(request)
+    num_users = len(users_list)
 
-    return None
-
-
-def sanitize_options(options):
-    try:
-        options.encode("ascii")
-    except UnicodeEncodeError:
-        raise ValueError("Options must contain only ASCII characters")
-
-    tokens = options.split()
-    token_regex = re.compile(r"^[^\s=]+=[^\s=]+$", flags=re.ASCII)
-    for token in tokens:
-        if not token_regex.fullmatch(token):
-            raise ValueError(
-                "Each option must be a 'key=value' pair with no extra spaces and exactly one '='"
-            )
-    return " ".join(tokens)
-
-
-def validate_form(request):
-    data = {
-        "base_tag": request.POST["base-branch"],
-        "new_tag": request.POST["test-branch"],
-        "tc": request.POST["tc"],
-        "new_tc": request.POST["new_tc"],
-        "book": request.POST["book"],
-        "book_depth": request.POST["book-depth"],
-        "base_signature": request.POST["base-signature"],
-        "new_signature": request.POST["test-signature"],
-        "base_options": sanitize_options(request.POST["base-options"]),
-        "new_options": sanitize_options(request.POST["new-options"]),
-        "username": request.authenticated_userid,
-        "tests_repo": request.POST["tests-repo"],
-        "info": request.POST["run-info"],
-        "arch_filter": request.POST["arch-filter"],
-        "compiler": request.POST["compiler"],
-    }
-    try:
-        # Deal with people that have changed their GitHub username
-        # but still use the old repo url
-        data["tests_repo"] = gh.normalize_repo(data["tests_repo"])
-    except Exception as e:
-        raise Exception(
-            f"Unable to access developer repository {data['tests_repo']}: {str(e)}"
-        ) from e
-
-    user, repo = gh.parse_repo(data["tests_repo"])
+    findme = request.params.get("findme", "").strip()
     username = request.authenticated_userid
-    u = request.userdb.get_user(username)
-
-    # Deal with people that have forked from "mcostalba/Stockfish" instead
-    # of from "official-stockfish/Stockfish".
-    official_repo = "https://github.com/official-stockfish/Stockfish"
-    master_repo = official_repo
-    try:
-        master_repo = gh.get_master_repo(user, repo, ignore_rate_limit=True)
-    except Exception as e:
-        print(
-            f"Unable to determine master repo for {data['tests_repo']}: {str(e)}",
-            flush=True,
+    target_username = ""
+    if findme and username:
+        target_username = username
+    elif search:
+        search_lower = search.lower()
+        exact_match = next(
+            (
+                user.get("username", "")
+                for user in users_list
+                if str(user.get("username", "")).lower() == search_lower
+            ),
+            "",
         )
-    else:
-        if master_repo != official_repo:
-            data["master_repo"] = master_repo
-            message = (
-                f"It seems that your repo {data['tests_repo']} has been forked from "
-                f"{master_repo} and not from {official_repo} "
-                "as recommended in the wiki. As such, some functionality may be broken. "
-            )
-            suffix_soft = (
-                "Please consider replacing your repo with one forked from the official "
-                "Stockfish repo!"
-            )
-            suffix_hard = (
-                "Please replace your repo with one forked from the official "
-                "Stockfish repo!"
-            )
-            if u["registration_time"] >= datetime(2025, 7, 1, tzinfo=UTC):
-                raise Exception(message + " " + suffix_hard)
-            else:
-                request.session.flash(
-                    message + " " + suffix_soft,
-                    "warning",
-                )
-    odds = request.POST.get("odds", "off")  # off checkboxes are not posted
-    if odds == "off":
-        data["new_tc"] = data["tc"]
-
-    checkbox_compiler = request.POST.get(
-        "checkbox-compiler", "off"
-    )  # off checkboxes are not posted
-    if checkbox_compiler == "off":
-        del data["compiler"]
-
-    checkbox_arch_filter = request.POST.get(
-        "checkbox-arch-filter", "off"
-    )  # off checkboxes are not posted
-    if checkbox_arch_filter == "off":
-        data["arch_filter"] = ""
-
-    if data["arch_filter"] == "":
-        del data["arch_filter"]
-
-    # check if arch filter is a valid regular expression
-    try:
-        if "arch_filter" in data:
-            regex.compile(data["arch_filter"])
-    except regex.error as e:
-        raise Exception(f"Invalid arch filter: {e}") from e
-
-    # check if there are any remaining arches
-    if "arch_filter" in data:
-        filtered_arches = filter(
-            lambda x: regex.search(data["arch_filter"], x) is not None, supported_arches
-        )
-        if list(filtered_arches) == []:
-            raise Exception(f"filter {data['arch_filter']} has no compatible arches")
-
-    validate(tc_schema, data["tc"], "data['tc']")
-    validate(tc_schema, data["new_tc"], "data['new_tc']")
-
-    if request.POST.get("rescheduled_from"):
-        data["rescheduled_from"] = request.POST["rescheduled_from"]
-
-    def strip_message(m):
-        lines = m.strip().split("\n")
-        bench_search = re.compile(r"(^|\s)[Bb]ench[ :]+([1-9]\d{5,7})(?!\d)")
-        for i, line in enumerate(reversed(lines)):
-            new_line, n = bench_search.subn("", line)
-            if n:
-                lines[-i - 1] = new_line
-                break
-        s = "\n".join(lines)
-        s = re.sub(r"[ \t]+", " ", s)
-        s = re.sub(r"\n+", r"\n", s)
-        return s.rstrip()
-
-    # Fill new_signature/info from commit info if left blank
-    if len(data["new_signature"]) == 0 or len(data["info"]) == 0:
-        try:
-            c = gh.get_commit(
-                user=user, repo=repo, branch=data["new_tag"], ignore_rate_limit=True
-            )
-        except Exception as e:
-            raise Exception(
-                f"Unable to access developer repository {data['tests_repo']}: {str(e)}"
-            ) from e
-        if "commit" not in c:
-            raise Exception(
-                f"Cannot find branch {data['new_tag']} in developer repository"
-            )
-        if len(data["new_signature"]) == 0:
-            bench_search = re.compile(r"(^|\s)[Bb]ench[ :]+([1-9]\d{5,7})(?!\d)")
-            lines = c["commit"]["message"].split("\n")
-            for line in reversed(lines):  # Iterate in reverse to find the last match
-                m = bench_search.search(line)
-                if m:
-                    data["new_signature"] = m.group(2)
-                    break
-            else:
-                raise Exception(
-                    "This commit has no signature: please supply it manually."
-                )
-        if len(data["info"]) == 0:
-            data["info"] = strip_message(c["commit"]["message"])
-
-    if request.POST["stop_rule"] == "spsa":
-        data["base_signature"] = data["new_signature"]
-
-    for k, v in data.items():
-        if len(v) == 0:
-            raise Exception(f"Missing required option: {k}")
-
-    # Handle boolean options
-    data["auto_purge"] = request.POST.get("auto-purge") is not None
-    # checkbox is to _disable_ adjudication
-    data["adjudication"] = request.POST.get("adjudication") is None
-
-    # In case of reschedule use old data,
-    # otherwise resolve sha and update user's tests_repo
-    if "resolved_base" in request.POST:
-        data["resolved_base"] = request.POST["resolved_base"]
-        data["resolved_new"] = request.POST["resolved_new"]
-        data["msg_base"] = request.POST["msg_base"]
-        data["msg_new"] = request.POST["msg_new"]
-    else:
-        data["resolved_base"], data["msg_base"] = get_sha(
-            data["base_tag"], data["tests_repo"]
-        )
-        data["resolved_new"], data["msg_new"] = get_sha(
-            data["new_tag"], data["tests_repo"]
-        )
-        u = request.userdb.get_user(data["username"])
-        if u.get("tests_repo", "") != data["tests_repo"]:
-            u["tests_repo"] = data["tests_repo"]
-            request.userdb.save_user(u)
-
-    if len(data["resolved_base"]) == 0 or len(data["resolved_new"]) == 0:
-        raise Exception("Unable to find branch!")
-
-    # Check entered bench
-    if data["base_tag"] == "master":
-        master_info = get_master_info(user=user, repo=repo, ignore_rate_limit=True)
-        master_bench = (
-            master_info.get("bench") if isinstance(master_info, dict) else None
-        )
-        if master_bench is None:
-            # GitHub is transiently unavailable; skip strict verification.
-            print(
-                "Unable to verify master bench signature (GitHub API unavailable).",
-                flush=True,
-            )
-        elif master_bench != data["base_signature"]:
-            raise Exception(
-                "Bench signature of Base master does not match, "
-                + 'please "git pull upstream master" !'
-            )
-
-    stop_rule = request.POST["stop_rule"]
-
-    # Store nets info
-    data["base_nets"] = get_nets(data["resolved_base"], data["tests_repo"])
-    data["new_nets"] = get_nets(data["resolved_new"], data["tests_repo"])
-
-    # Test existence of nets
-    missing_nets = []
-    for net_name in set(data["base_nets"]) | set(data["new_nets"]):
-        net = request.rundb.get_nn(net_name)
-        if net is None:
-            missing_nets.append(net_name)
-    if missing_nets:
-        raise Exception(
-            "Missing net(s). Please upload to: {} the following net(s): {}".format(
-                _host_url(request),
-                ", ".join(missing_nets),
-            )
-        )
-
-    # Integer parameters
-    data["threads"] = int(request.POST["threads"])
-    data["priority"] = int(request.POST["priority"])
-    data["throughput"] = int(request.POST["throughput"])
-
-    if data["threads"] <= 0:
-        raise Exception("Threads must be >= 1")
-
-    if stop_rule == "sprt":
-        # Too small a number results in many API calls, especially with highly concurrent workers.
-        # This expression results in 32 games per batch for single threaded STC games.
-        # This means a batch with be completed in roughly 2 minutes on a 8 core worker.
-        # This expression adjusts the batch size for threads and TC, to keep timings somewhat similar.
-        sprt_batch_size_games = 2 * max(
-            1, int(0.5 + 16 / get_tc_ratio(data["tc"], data["threads"]))
-        )
-        assert sprt_batch_size_games % 2 == 0
-        elo_model = request.POST["elo_model"]
-        if elo_model not in ["BayesElo", "logistic", "normalized"]:
-            raise Exception("Unknown Elo model")
-        data["sprt"] = fishtest.stats.stat_util.SPRT(
-            alpha=0.05,
-            beta=0.05,
-            elo0=float(request.POST["sprt_elo0"]),
-            elo1=float(request.POST["sprt_elo1"]),
-            elo_model=elo_model,
-            batch_size=sprt_batch_size_games // 2,
-        )  # game pairs
-        # Limit on number of games played.
-        data["num_games"] = 800000
-    elif stop_rule == "spsa":
-        data["num_games"] = int(request.POST["num-games"])
-        if data["num_games"] <= 0:
-            raise Exception("Number of games must be >= 0")
-
-        data["spsa"] = {
-            "A": int(float(request.POST["spsa_A"]) * data["num_games"] / 2),
-            "alpha": float(request.POST["spsa_alpha"]),
-            "gamma": float(request.POST["spsa_gamma"]),
-            "raw_params": request.POST["spsa_raw_params"],
-            "iter": 0,
-            "num_iter": int(data["num_games"] / 2),
-        }
-        data["spsa"]["params"] = parse_spsa_params(data["spsa"])
-        if len(data["spsa"]["params"]) == 0:
-            raise Exception("Number of params must be > 0")
-    else:
-        data["num_games"] = int(request.POST["num-games"])
-        if data["num_games"] <= 0:
-            raise Exception("Number of games must be >= 0")
-
-    max_games = 3200000
-    if data["num_games"] > max_games:
-        raise Exception("Number of games must be <= " + str(max_games))
-
-    return data
-
-
-def del_tasks(run):
-    run = copy.copy(run)
-    run.pop("tasks", None)
-    run = copy.deepcopy(run)
-    return run
-
-
-def update_nets(request, run):
-    run_id = str(run["_id"])
-    data = run["args"]
-    base_nets, new_nets, missing_nets = [], [], []
-    for net_name in set(data["base_nets"]) | set(data["new_nets"]):
-        net = request.rundb.get_nn(net_name)
-        if net is None:
-            # This should never happen
-            missing_nets.append(net_name)
+        if exact_match:
+            target_username = exact_match
         else:
-            if net_name in data["base_nets"]:
-                base_nets.append(net)
-            if net_name in data["new_nets"]:
-                new_nets.append(net)
-    if missing_nets:
-        raise Exception(
-            "Missing net(s). Please upload to {} the following net(s): {}".format(
-                _host_url(request),
-                ", ".join(missing_nets),
+            target_username = next(
+                (
+                    user.get("username", "")
+                    for user in users_list
+                    if search_lower in str(user.get("username", "")).lower()
+                ),
+                "",
             )
+
+    if target_username:
+        user_rank = next(
+            (
+                idx
+                for idx, user in enumerate(users_list, start=1)
+                if user.get("username") == target_username
+            ),
+            None,
         )
+        if user_rank is not None:
+            target_page = str((user_rank - 1) // _CONTRIBUTORS_PAGE_SIZE + 1)
+            current_page = str(page_idx + 1)
+            highlight_matches = highlight.lower() == target_username.lower()
+            if view_param == "all":
+                # In full view there is no page navigation, so a matching highlight
+                # is the only signal that the jump/go-to has already been applied.
+                already_on_target = highlight_matches
+            else:
+                already_on_target = current_page == target_page and highlight_matches
+            if not already_on_target:
+                params = {
+                    "sort": sort_param,
+                    "order": order_param,
+                    "highlight": target_username,
+                    "view": view_param,
+                }
+                # Keep findme sticky across redirect hops so a non-empty search
+                # query cannot override jump-to-my-rank on the follow-up request.
+                if findme:
+                    params["findme"] = "1"
+                if view_param == "paged":
+                    params["page"] = target_page
+                return RedirectResponse(
+                    url=f"{request.path}?{urlencode(params)}#me",
+                    status_code=302,
+                )
 
-    tests_repo_ = tests_repo(run)
-    user, repo = gh.parse_repo(tests_repo_)
-    try:
-        if gh.is_master(
-            run["args"]["resolved_base"],
-        ):
-            for net in base_nets:
-                if "is_master" not in net:
-                    net["is_master"] = True
-                    request.rundb.update_nn(net)
-    except Exception as e:
-        print(f"Unable to evaluate is_master({run['args']['resolved_base']}): {str(e)}")
+    for idx, user in enumerate(users_list, start=1):
+        user["_rank"] = idx
 
-    for net in new_nets:
-        if "first_test" not in net:
-            net["first_test"] = {"id": run_id, "date": datetime.now(UTC)}
-        net["last_test"] = {"id": run_id, "date": datetime.now(UTC)}
-        request.rundb.update_nn(net)
+    if highlight and not any(
+        str(user.get("username", "")).lower() == highlight.lower()
+        for user in users_list
+    ):
+        highlight = ""
 
-
-def new_run_message(request, run):
-    if "sprt" in run["args"]:
-        sprt = run["args"]["sprt"]
-        elo_model = sprt.get("elo_model")
-        ret = f"SPRT{format_bounds(elo_model, sprt['elo0'], sprt['elo1'])}"
-    elif "spsa" in run["args"]:
-        ret = f"SPSA[{run['args']['num_games']}]"
+    if view_param == "all":
+        users_page = users_list[:_CONTRIBUTORS_MAX_ALL]
+        is_truncated = num_users > _CONTRIBUTORS_MAX_ALL
+        if is_truncated:
+            logger.info(
+                "contributors view=all truncated at %d rows (total=%d, monthly=%s)",
+                _CONTRIBUTORS_MAX_ALL,
+                num_users,
+                is_monthly,
+            )
     else:
-        ret = f"NumGames[{run['args']['num_games']}]"
-        if run["args"]["resolved_base"] == request.rundb.pt_info["pt_branch"]:
-            ret += f"(PT:{request.rundb.pt_info['pt_version']})"
-    ret += f" TC:{run['args']['tc']}"
-    ret += (
-        f"[{run['args']['new_tc']}]"
-        if run["args"]["new_tc"] != run["args"]["tc"]
-        else ""
+        start = page_idx * _CONTRIBUTORS_PAGE_SIZE
+        end = (page_idx + 1) * _CONTRIBUTORS_PAGE_SIZE
+        users_page = users_list[start:end]
+        is_truncated = False
+
+    is_approver = request.has_permission("approve_run")
+    rows = build_contributors_rows(users_page, is_approver=is_approver)
+
+    pages = []
+    if view_param == "paged":
+        default_order = "desc" if default_reverse else "asc"
+        query_params = _build_query_string(
+            [
+                (
+                    "sort",
+                    sort_param if sort_param != _CONTRIBUTORS_DEFAULT_SORT else None,
+                ),
+                ("order", order_param if order_param != default_order else None),
+            ],
+        )
+        pages = pagination(page_idx, num_users, _CONTRIBUTORS_PAGE_SIZE, query_params)
+
+    context = {
+        "is_monthly": is_monthly,
+        "monthly_suffix": " - Top Month" if is_monthly else "",
+        "summary": build_contributors_summary(all_users_unfiltered),
+        "users": rows,
+        "pages": pages,
+        "is_approver": is_approver,
+        "search": search,
+        "sort": sort_param,
+        "order": order_param,
+        "view": view_param,
+        "highlight": highlight,
+        "is_truncated": is_truncated,
+        "num_users": num_users,
+        "max_all": _CONTRIBUTORS_MAX_ALL,
+    }
+    return _render_hx_or_context(
+        request,
+        "contributors_content_fragment.html.j2",
+        context,
     )
-    ret += "(LTC)" if run["tc_base"] >= request.rundb.ltc_lower_bound else ""
-    ret += f" Book:{run['args']['book']}"
-    ret += f" Threads:{run['args']['threads']}"
-    ret += "(SMP)" if run["args"]["threads"] > 1 else ""
-    ret += f" Hash:{get_hash(run['args']['base_options'])}/{get_hash(run['args']['new_options'])}"
-    return ret
 
 
-# === Run creation ===
-def tests_run(request):
+def contributors(request: _ViewContext) -> dict[str, Any] | RedirectResponse | Response:
+    return _contributors_common(
+        request,
+        collection=request.userdb.user_cache,
+        is_monthly=False,
+    )
+
+
+def contributors_monthly(
+    request: _ViewContext,
+) -> dict[str, Any] | RedirectResponse | Response:
+    return _contributors_common(
+        request,
+        collection=request.userdb.top_month,
+        is_monthly=True,
+    )
+
+
+# === Homepage And Run Lists ===
+def tests_machines(request: _ViewContext) -> dict[str, Any] | Response:
+    return _tests_machines_impl(request)
+
+
+def _build_toggle_states(
+    request: _ViewContext,
+    toggle_names: list[str],
+) -> dict[str, str]:
+    return {name: request.cookies.get(f"{name}_state", "Show") for name in toggle_names}
+
+
+def _build_run_tables_context(  # noqa: PLR0913
+    request: _ViewContext,
+    *,
+    runs: dict[str, list[dict[str, Any]]] | None,
+    failed_runs: list[dict[str, Any]],
+    finished_runs: list[dict[str, Any]],
+    num_finished_runs: int,
+    finished_runs_pages: list[dict[str, object]],
+    page_idx: int,
+    username: str = "",
+) -> dict[str, Any]:
+    runs = runs or {"pending": [], "active": []}
+    pending_runs = [r for r in runs.get("pending", []) if not r.get("approved")]
+    paused_runs = [r for r in runs.get("pending", []) if r.get("approved")]
+    active_runs = list(runs.get("active", []))
+    active_run_filters = (
+        _build_active_run_filter_context(request, active_runs)
+        if page_idx == 0 and not username
+        else None
+    )
+    active_runs_for_display = (
+        active_run_filters["ordered_runs"]
+        if active_run_filters is not None
+        else active_runs
+    )
+    prefix = run_tables_prefix(username)
+    toggle_names = [prefix + "finished"]
+    if page_idx == 0:
+        toggle_names = [
+            prefix + "pending",
+            prefix + "paused",
+            prefix + "failed",
+            prefix + "active",
+            prefix + "finished",
+        ]
+    toggle_states = _build_toggle_states(request, toggle_names)
+    finished_title_text = (
+        f"{username + ' - ' if username else ''}Finished Tests"
+        f" - page {page_idx + 1} | Stockfish Testing"
+    )
+
+    return {
+        "pending_approval_runs": build_run_table_rows(
+            pending_runs,
+            allow_github_api_calls=False,
+        ),
+        "paused_runs": build_run_table_rows(
+            paused_runs,
+            allow_github_api_calls=False,
+        ),
+        "failed_runs": build_run_table_rows(
+            failed_runs,
+            allow_github_api_calls=False,
+        ),
+        "active_runs": build_run_table_rows(
+            active_runs_for_display,
+            allow_github_api_calls=False,
+        ),
+        "active_count_text": (
+            active_run_filters["count_text"]
+            if active_run_filters is not None
+            else f"Active - {len(active_runs)} tests"
+        ),
+        "active_run_filters": active_run_filters,
+        "finished_runs": build_run_table_rows(
+            finished_runs,
+            allow_github_api_calls=False,
+        ),
+        "num_finished_runs": num_finished_runs,
+        "finished_runs_pages": finished_runs_pages,
+        "page_idx": page_idx,
+        "prefix": prefix,
+        "toggle_states": toggle_states,
+        "finished_title_text": finished_title_text,
+        "show_gauge": False,
+    }
+
+
+def tests_finished(request: _ViewContext) -> dict[str, Any] | Response:
+    context = get_paginated_finished_runs(request)
+    if isinstance(context, RedirectResponse):
+        return context
+    page_idx = context["page_idx"]
+    title_suffix = context["title_suffix"]
+    search_mode = context["search_mode"]
+    if search_mode:
+        title_text = f"Search Finished Tests - page {page_idx + 1} | Stockfish Testing"
+    else:
+        title_text = (
+            f"Finished Tests{title_suffix} - page {page_idx + 1} | Stockfish Testing"
+        )
+    context_out = {
+        **context,
+        "query_params": request.query_params,
+        "finished_runs": build_run_table_rows(
+            context["finished_runs"],
+            allow_github_api_calls=False,
+        ),
+        "failed_runs": build_run_table_rows(
+            context["failed_runs"],
+            allow_github_api_calls=False,
+        ),
+        "title": title_suffix,
+        "title_text": title_text,
+        "show_gauge": False,
+    }
+
+    return _render_hx_or_context(
+        request,
+        "tests_finished_results_fragment.html.j2",
+        context_out,
+        extra_context={"is_hx": True},
+    )
+
+
+def tests_user(request: _ViewContext) -> dict[str, Any] | Response:
+    _append_no_store_headers(request)
+    username = request.matchdict.get("username", "")
+    user_data = request.userdb.get_user(username)
+    if user_data is None:
+        raise StarletteHTTPException(status_code=404)
+    is_approver = request.has_permission("approve_run")
+    finished_context = get_paginated_finished_runs(request)
+    if isinstance(finished_context, RedirectResponse):
+        return finished_context
+    response = {
+        **finished_context,
+        "username": username,
+        "is_approver": is_approver,
+    }
+    page_param = request.params.get("page", "")
+    if not page_param.isdigit() or int(page_param) <= 1:
+        runs = request.rundb.aggregate_unfinished_runs(username=username)[0]
+        response["run_tables_ctx"] = _build_run_tables_context(
+            request,
+            runs=runs,
+            failed_runs=finished_context["failed_runs"],
+            finished_runs=finished_context["finished_runs"],
+            num_finished_runs=finished_context["num_finished_runs"],
+            finished_runs_pages=finished_context["finished_runs_pages"],
+            page_idx=finished_context["page_idx"],
+            username=username,
+        )
+    else:
+        response["run_tables_ctx"] = _build_run_tables_context(
+            request,
+            runs=None,
+            failed_runs=finished_context["failed_runs"],
+            finished_runs=finished_context["finished_runs"],
+            num_finished_runs=finished_context["num_finished_runs"],
+            finished_runs_pages=finished_context["finished_runs_pages"],
+            page_idx=finished_context["page_idx"],
+            username=username,
+        )
+    # page 2 and beyond only show finished test results
+    return _render_hx_or_context(
+        request,
+        "tests_user_content_fragment.html.j2",
+        response,
+    )
+
+
+def homepage_results(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    # Get updated results for unfinished runs + finished runs
+
+    (
+        runs,
+        pending_hours,
+        cores,
+        nps,
+        games_per_minute,
+        machines_count,
+    ) = request.rundb.aggregate_unfinished_runs()
+    finished_context = get_paginated_finished_runs(request)
+    if isinstance(finished_context, RedirectResponse):
+        return finished_context
+    run_tables_ctx = _build_run_tables_context(
+        request,
+        runs=runs,
+        failed_runs=finished_context["failed_runs"],
+        finished_runs=finished_context["finished_runs"],
+        num_finished_runs=finished_context["num_finished_runs"],
+        finished_runs_pages=finished_context["finished_runs_pages"],
+        page_idx=finished_context["page_idx"],
+    )
+    return {
+        **finished_context,
+        "runs": runs,
+        "run_tables_ctx": run_tables_ctx,
+        "machines_count": machines_count,
+        "pending_hours": f"{pending_hours:.1f}",
+        "cores": cores,
+        "nps": nps,
+        "nps_m": f"{nps / 1000000:.0f}M",
+        "games_per_minute": int(games_per_minute),
+        "height": f"{machines_count * 37}px",
+        "min_height": "37px",
+        "max_height": "34.7vh",
+    }
+
+
+def tests(request: _ViewContext) -> dict[str, Any] | Response:
+    # The homepage mixes user-specific state with frequently refreshed content,
+    # so intermediary caches must not store it.
+    _append_no_store_headers(request)
+    page_param = request.params.get("page", "")
+    if page_param.isdigit() and int(page_param) > 1:
+        # page 2 and beyond only show finished test results
+        finished_context = get_paginated_finished_runs(request)
+        if isinstance(finished_context, RedirectResponse):
+            return finished_context
+        return {
+            **finished_context,
+            "run_tables_ctx": _build_run_tables_context(
+                request,
+                runs=None,
+                failed_runs=finished_context["failed_runs"],
+                finished_runs=finished_context["finished_runs"],
+                num_finished_runs=finished_context["num_finished_runs"],
+                finished_runs_pages=finished_context["finished_runs_pages"],
+                page_idx=finished_context["page_idx"],
+            ),
+        }
+
+    last_tests = homepage_results(request)
+    if isinstance(last_tests, RedirectResponse):
+        return last_tests
+
+    authenticated_user = request.authenticated_userid
+
+    machines_sort = request.cookies.get("machines_sort", "").strip().lower()
+    if machines_sort not in _MACHINES_SORT_MAP:
+        machines_sort = _MACHINES_DEFAULT_SORT
+
+    _, machines_default_reverse = _MACHINES_SORT_MAP[machines_sort]
+    machines_order = request.cookies.get("machines_order", "").strip().lower()
+    if machines_order not in {"asc", "desc"}:
+        machines_order = "desc" if machines_default_reverse else "asc"
+
+    machines_q = unquote(request.cookies.get("machines_q", ""))
+
+    machines_page_raw = request.cookies.get("machines_page", "")
+    if machines_page_raw.isdigit() and int(machines_page_raw) >= 1:
+        machines_page = int(machines_page_raw)
+    else:
+        machines_page = 1
+
+    machines_my_workers = _is_truthy_param(
+        request.cookies.get("machines_my_workers", ""),
+    )
+    if not authenticated_user:
+        machines_my_workers = False
+
+    machine_filters = _machine_filter_state(
+        request.cookies,
+        authenticated_username=authenticated_user,
+        use_cookies=True,
+        query_key="machines_q",
+        my_workers_key="machines_my_workers",
+    )
+    machines_filters_active = machine_filters["filters_active"]
+    if machines_filters_active:
+        machines_filtered_count = _filtered_machine_count(
+            request,
+            query_filter=machine_filters["query_filter"],
+            my_workers=machine_filters["my_workers"],
+            authenticated_username=authenticated_user,
+        )
+    else:
+        machines_filtered_count = last_tests["machines_count"]
+    workers_count = _workers_count_label(
+        last_tests["machines_count"],
+        query_filter=machine_filters["query_filter"],
+        my_workers=machine_filters["my_workers"],
+        filtered_count=machines_filtered_count,
+    )
+
+    return {
+        **last_tests,
+        "machines_shown": request.cookies.get("machines_state") == "Hide",
+        "workers_count_text": workers_count,
+        "machines_sort": machines_sort,
+        "machines_order": machines_order,
+        "machines_q": machines_q,
+        "machines_page": machines_page,
+        "machines_my_workers": machines_my_workers,
+        "has_authenticated_user": bool(authenticated_user),
+    }
+
+
+# === Run Mutation ===
+
+
+# === Run Creation ===
+def tests_run(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
     user_id = ensure_logged_in(request)
     if isinstance(user_id, RedirectResponse):
         return user_id
@@ -1824,12 +2220,13 @@ def tests_run(request):
                 message=new_run_message(request, run),
             )
             request.session.flash(
-                "The test was submitted to the queue. Please wait for approval."
+                "The test was submitted to the queue. Please wait for approval.",
             )
             return RedirectResponse(
-                url="/tests/view/" + str(run_id) + "?follow=1", status_code=302
+                url="/tests/view/" + str(run_id) + "?follow=1",
+                status_code=302,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             request.session.flash(str(e), "error")
 
     run_args = {}
@@ -1867,7 +2264,7 @@ def tests_run(request):
     return {
         "args": run_args,
         "is_rerun": len(run_args) > 0,
-        "rescheduled_from": request.params["id"] if "id" in request.params else None,
+        "rescheduled_from": request.params.get("id", None),
         "form_action": request.url,
         "tests_repo_value": tests_repo_value,
         "new_tag_value": new_tag_value,
@@ -1886,16 +2283,8 @@ def tests_run(request):
     }
 
 
-def is_same_user(request, run):
-    return run["args"]["username"] == request.authenticated_userid
-
-
-def can_modify_run(request, run):
-    return is_same_user(request, run) or request.has_permission("approve_run")
-
-
-# === Run admin actions ===
-def tests_modify(request):
+# === Run Administration ===
+def tests_modify(request: _ViewContext) -> RedirectResponse | dict[str, Any]:  # noqa: C901, PLR0912
     userid = ensure_logged_in(request)
     if isinstance(userid, RedirectResponse):
         return userid
@@ -1935,7 +2324,7 @@ def tests_modify(request):
         run["args"]["num_games"] = int(request.POST["num-games"])
         run["args"]["priority"] = int(request.POST["priority"])
         run["args"]["throughput"] = int(request.POST["throughput"])
-        run["args"]["auto_purge"] = True if request.POST.get("auto_purge") else False
+        run["args"]["auto_purge"] = bool(request.POST.get("auto_purge"))
         if (
             is_same_user(request, run)
             and "info" in request.POST
@@ -1959,8 +2348,10 @@ def tests_modify(request):
             if before_ != after_:
                 message.append(
                     "{} changed from {} to {}".format(
-                        k.replace("_", "-"), before_, after_
-                    )
+                        k.replace("_", "-"),
+                        before_,
+                        after_,
+                    ),
                 )
 
     message = "modify: " + ", ".join(message)
@@ -1983,7 +2374,7 @@ def tests_modify(request):
     return home(request)
 
 
-def tests_stop(request):
+def tests_stop(request: _ViewContext) -> RedirectResponse | dict[str, Any]:
     if not request.authenticated_userid:
         request.session.flash("Please login")
         return RedirectResponse(url="/login", status_code=302)
@@ -2003,7 +2394,7 @@ def tests_stop(request):
     return home(request)
 
 
-def tests_approve(request):
+def tests_approve(request: _ViewContext) -> RedirectResponse:
     if not request.authenticated_userid:
         return RedirectResponse(url="/login", status_code=302)
     if not request.has_permission("approve_run"):
@@ -2017,18 +2408,19 @@ def tests_approve(request):
     else:
         try:
             update_nets(request, run)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             request.session.flash(str(e), "error")
         request.actiondb.approve_run(username=username, run=run, message="approved")
-        request.session.flash(message)
+        if message:
+            request.session.flash(message)
     return home(request)
 
 
-def tests_purge(request):
+def tests_purge(request: _ViewContext) -> RedirectResponse | dict[str, Any]:
     run = request.rundb.get_run(request.POST["run-id"])
     if not request.has_permission("approve_run") and not is_same_user(request, run):
         request.session.flash(
-            "Only approvers or the submitting user can purge the run."
+            "Only approvers or the submitting user can purge the run.",
         )
         return RedirectResponse(url="/login", status_code=302)
 
@@ -2043,6 +2435,7 @@ def tests_purge(request):
             f"Manual purge (not performed): {message}" if message else "Manual purge"
         ),
     )
+
     if message != "":
         request.session.flash(message)
         return home(request)
@@ -2051,7 +2444,7 @@ def tests_purge(request):
     return home(request)
 
 
-def tests_delete(request):
+def tests_delete(request: _ViewContext) -> RedirectResponse | dict[str, Any]:
     if not request.authenticated_userid:
         request.session.flash("Please login")
         return RedirectResponse(url="/login", status_code=302)
@@ -2067,9 +2460,9 @@ def tests_delete(request):
             validate(runs_schema, run, "run")
         except ValidationError as e:
             message = (
-                f"The run object {request.POST['run-id']} does not validate: {str(e)}"
+                f"The run object {request.POST['run-id']} does not validate: {e!s}"
             )
-            print(message, flush=True)
+            logger.warning(message)
             if "version" in run and run["version"] >= RUN_VERSION:
                 request.actiondb.log_message(
                     username="fishtest.system",
@@ -2085,52 +2478,410 @@ def tests_delete(request):
     return home(request)
 
 
-# === Run detail views ===
-def get_page_title(run):
+# === Run Detail ===
+def get_page_title(run: dict[str, Any]) -> str:
     if run["args"].get("sprt"):
         page_title = "SPRT {} vs {}".format(
-            run["args"]["new_tag"], run["args"]["base_tag"]
+            run["args"]["new_tag"],
+            run["args"]["base_tag"],
         )
     elif run["args"].get("spsa"):
         page_title = "SPSA {}".format(run["args"]["new_tag"])
     else:
         page_title = "{} games - {} vs {}".format(
-            run["args"]["num_games"], run["args"]["new_tag"], run["args"]["base_tag"]
+            run["args"]["num_games"],
+            run["args"]["new_tag"],
+            run["args"]["base_tag"],
         )
     return page_title
 
 
-def tests_live_elo(request):
-    run = request.rundb.get_run(request.matchdict["id"])
-    if run is None or "sprt" not in run["args"]:
-        raise StarletteHTTPException(status_code=404)
-    return {"run": run, "page_title": get_page_title(run)}
+def _build_live_elo_context(run: dict[str, Any]) -> dict[str, Any]:
+    """Compute SPRT analytics and return template context for gauges + details."""
+    run_status_label = _classify_run_status(run)
+    if run_status_label == "failed":
+        run_status_label = "finished"
+
+    results = run["results"]
+    sprt = run["args"]["sprt"]
+    elo_model = sprt.get("elo_model", "BayesElo")
+    a = fishtest.stats.stat_util.SPRT_elo(
+        results,
+        alpha=sprt["alpha"],
+        beta=sprt["beta"],
+        elo0=sprt["elo0"],
+        elo1=sprt["elo1"],
+        elo_model=elo_model,
+    )
+    WLD = [results["wins"], results["losses"], results["draws"]]  # noqa: N806
+    games = sum(WLD)
+    pentanomial = results.get("pentanomial", [])
+    return {
+        "run": run,
+        "run_status_label": run_status_label,
+        "elo_raw": a["elo"],
+        "ci_lower_raw": a["ci"][0],
+        "ci_upper_raw": a["ci"][1],
+        "LLR_raw": a["LLR"],
+        "LOS_raw": 100 * a["LOS"],
+        "a_raw": a["a"],
+        "b_raw": a["b"],
+        "elo_value": round(a["elo"], 2),
+        "ci_lower": round(a["ci"][0], 2),
+        "ci_upper": round(a["ci"][1], 2),
+        "LLR": round(a["LLR"], 2),
+        "LOS": round(100 * a["LOS"], 1),
+        "a": round(a["a"], 2),
+        "b": round(a["b"], 2),
+        "W": WLD[0],
+        "L": WLD[1],
+        "D": WLD[2],
+        "games": games,
+        "w_pct": round((100 * WLD[0]) / (games + 0.001), 1),
+        "l_pct": round((100 * WLD[1]) / (games + 0.001), 1),
+        "d_pct": round((100 * WLD[2]) / (games + 0.001), 1),
+        "pentanomial": pentanomial[:5],
+        "sprt_state": sprt.get("state", ""),
+        "elo_model": elo_model,
+        "elo0": sprt["elo0"],
+        "elo1": sprt["elo1"],
+        "alpha": sprt["alpha"],
+        "beta": sprt["beta"],
+    }
 
 
-def tests_stats(request):
+def _classify_run_status(run: dict[str, Any]) -> str:
+    if run.get("finished", False):
+        return "failed" if run.get("failed") else "finished"
+    if run.get("workers", 0) > 0:
+        return "active"
+    return "paused" if run.get("approved") else "pending"
+
+
+def tests_elo_batch(request: _ViewContext) -> dict[str, Any] | RedirectResponse:
+    username = request.params.get("username", "") or ""
+
+    (
+        runs,
+        pending_hours,
+        cores,
+        nps,
+        games_per_minute,
+        machines_count,
+    ) = request.rundb.aggregate_unfinished_runs(username=username or None)
+
+    pending_all = list(runs.get("pending", []))
+    active_runs = list(runs.get("active", []))
+    pending_runs = [r for r in pending_all if not r.get("approved")]
+    paused_runs = [r for r in pending_all if r.get("approved")]
+    active_run_filters = (
+        _build_active_run_filter_context(request, active_runs) if not username else None
+    )
+    active_runs_for_display = (
+        active_run_filters["ordered_runs"]
+        if active_run_filters is not None
+        else active_runs
+    )
+
+    allow_github_api_calls = request.has_permission("approve_run")
+
+    finished_context = get_paginated_finished_runs(request, username=username)
+    if isinstance(finished_context, RedirectResponse):
+        return finished_context
+    failed_runs = finished_context["failed_runs"]
+    finished_runs = finished_context["finished_runs"]
+
+    panels: list[_BatchPanel] = [
+        {
+            "tbody_id": "pending-tbody",
+            "rows": build_run_table_rows(
+                pending_runs,
+                allow_github_api_calls=allow_github_api_calls,
+            ),
+            "show_delete": True,
+            "empty_text": "No tests pending approval",
+        },
+        {
+            "tbody_id": "paused-tbody",
+            "rows": build_run_table_rows(
+                paused_runs,
+                allow_github_api_calls=allow_github_api_calls,
+            ),
+            "show_delete": True,
+            "empty_text": "No paused tests",
+        },
+        {
+            "tbody_id": "failed-tbody",
+            "rows": build_run_table_rows(
+                failed_runs,
+                allow_github_api_calls=allow_github_api_calls,
+            ),
+            "show_delete": True,
+            "empty_text": "No failed tests on this page",
+        },
+        {
+            "tbody_id": "active-tbody",
+            "rows": build_run_table_rows(
+                active_runs_for_display,
+                allow_github_api_calls=allow_github_api_calls,
+            ),
+            "show_delete": False,
+            "empty_text": "No active tests",
+        },
+        {
+            "tbody_id": "finished-tbody",
+            "rows": build_run_table_rows(
+                finished_runs,
+                allow_github_api_calls=allow_github_api_calls,
+            ),
+            "show_delete": False,
+            "empty_text": "",
+        },
+    ]
+
+    count_updates: list[_CountUpdate] = [
+        {
+            "id": "pending-count",
+            "text": f"Pending approval - {len(pending_runs)} tests",
+        },
+        {
+            "id": "paused-count",
+            "text": f"Paused - {len(paused_runs)} tests",
+        },
+        {
+            "id": "active-count",
+            "text": (
+                active_run_filters["count_text"]
+                if active_run_filters is not None
+                else f"Active - {len(active_runs)} tests"
+            ),
+        },
+        {
+            "id": "failed-count",
+            "text": f"Failed - {len(failed_runs)} tests",
+        },
+        {
+            "id": "finished-count",
+            "text": f"Finished - {finished_context['num_finished_runs']} tests",
+        },
+    ]
+
+    if not (pending_runs or paused_runs or active_runs):
+        request.response_status = 286
+
+    machine_filters = _machine_filter_state(
+        request.cookies,
+        authenticated_username=request.authenticated_userid,
+        use_cookies=True,
+        query_key="machines_q",
+        my_workers_key="machines_my_workers",
+    )
+    filters_active = machine_filters["filters_active"]
+
+    result: _TestsEloBatchContext = {
+        "panels": panels,
+        "count_updates": count_updates,
+    }
+
+    # workers-count target exists on homepage only.
+    if not username:
+        filtered_count = (
+            _filtered_machine_count(
+                request,
+                query_filter=machine_filters["query_filter"],
+                my_workers=machine_filters["my_workers"],
+                authenticated_username=request.authenticated_userid,
+            )
+            if filters_active
+            else machines_count
+        )
+        result["machines_count"] = machines_count
+        workers_count = _workers_count_label(
+            machines_count,
+            query_filter=machine_filters["query_filter"],
+            my_workers=machine_filters["my_workers"],
+            filtered_count=filtered_count,
+        )
+        result["workers_count_text"] = workers_count
+
+    # Include stats OOB updates for the homepage (no username filter).
+    if not username:
+        result["stats"] = {
+            "pending_hours": f"{pending_hours:.1f}",
+            "cores": cores,
+            "nps_m": f"{nps / 1000000:.0f}M",
+            "games_per_minute": int(games_per_minute),
+        }
+
+    return result  # type: ignore[invalid-return-type]
+
+
+def tests_elo(request: _ViewContext) -> dict[str, Any]:
     run = request.rundb.get_run(request.matchdict["id"])
     if run is None:
         raise StarletteHTTPException(status_code=404)
+
+    expected = (request.params.get("expected") or "").strip().lower()
+    actual = _classify_run_status(run)
+
+    if expected:
+        if actual in {"finished", "failed"}:
+            request.response_status = 286
+        elif actual == expected:
+            request.response_status = 204
+    elif actual in {"finished", "failed"}:
+        request.response_status = 286
+    elif actual != "active":
+        request.response_status = 204
+
+    active = 0
+    cores = 0
+    for task in run["tasks"]:
+        if task["active"]:
+            active += 1
+            cores += task["worker_info"]["concurrency"]
+    totals = "({} active worker{} with {} core{})".format(
+        active,
+        ("s" if active != 1 else ""),
+        cores,
+        ("s" if cores != 1 else ""),
+    )
+
     return {
+        "run": run,
+        "run_status_label": actual,
+        "tasks_totals": totals,
+    }
+
+
+def tests_live_elo(request: _ViewContext) -> dict[str, Any]:
+    run = request.rundb.get_run(request.matchdict["id"])
+    if run is None or "sprt" not in run["args"]:
+        raise StarletteHTTPException(status_code=404)
+    context = _build_live_elo_context(run)
+    context["page_title"] = get_page_title(run)
+    return context
+
+
+def live_elo_update(request: _ViewContext) -> dict[str, Any]:
+    run = request.rundb.get_run(request.matchdict["id"])
+    if run is None or "sprt" not in run["args"]:
+        raise StarletteHTTPException(status_code=404)
+
+    context = _build_live_elo_context(run)
+    if context["sprt_state"]:
+        request.response_status = 286
+    return context
+
+
+def tests_stats(request: _ViewContext) -> dict[str, Any] | Response:
+    run = request.rundb.get_run(request.matchdict["id"])
+    if run is None:
+        raise StarletteHTTPException(status_code=404)
+
+    context = {
         "run": run,
         "page_title": get_page_title(run),
         "stats": build_tests_stats_context(run),
     }
 
+    if _is_hx_request(request):
+        actual = _classify_run_status(run)
+        if actual in {"finished", "failed"}:
+            response = _render_hx_fragment(
+                request,
+                "tests_stats_content_fragment.html.j2",
+                context,
+            )
+            if response is not None:
+                response.status_code = 286
+                return response
+        elif actual != "active":
+            request.response_status = 204
+            return context
 
-def tests_tasks(request):
-    run = request.rundb.get_run(request.matchdict["id"])
-    if run is None:
-        raise StarletteHTTPException(status_code=404)
-    chi2 = get_chi2(run["tasks"])
+        response = _render_hx_fragment(
+            request,
+            "tests_stats_content_fragment.html.j2",
+            context,
+        )
+        return response or context
 
+    return context
+
+
+_TASKS_SORT_MAP: dict[str, tuple[str, bool]] = {
+    "idx": ("task_id", True),
+    "worker": ("worker_label", False),
+    "info": ("info_label", False),
+    "last_updated": ("last_updated_sort", True),
+    "played": ("played_sort", True),
+    "wins": ("wins", True),
+    "losses": ("losses", True),
+    "draws": ("draws", True),
+    "pentanomial": ("pentanomial_sort", True),
+    "crashes": ("crashes", True),
+    "time": ("time_losses", True),
+    "residual": ("residual_sort", True),
+}
+_TASKS_DEFAULT_SORT = "idx"
+_TASKS_PAGE_SIZE = TASKS_PAGE_SIZE
+_TASKS_MAX_ALL = TASKS_MAX_ALL
+
+
+def _tasks_cookie_value(request: _ViewContext, name: str) -> str:
+    return unquote(str(request.cookies.get(name, ""))).strip()
+
+
+def _parse_show_task_param(request: _ViewContext) -> int:
     try:
         show_task = int(request.params.get("show_task", -1))
     except ValueError:
-        show_task = -1
-    if show_task >= len(run["tasks"]) or show_task < -1:
-        show_task = -1
+        return -1
+    return max(show_task, -1)
 
+
+def _task_filter_value(
+    request: _ViewContext,
+    *,
+    param_name: str,
+    cookie_name: str,
+) -> str:
+    raw_value = request.params.get(param_name)
+    if raw_value is None:
+        raw_value = _tasks_cookie_value(request, cookie_name)
+    return str(raw_value).strip()
+
+
+def _filter_task_rows(
+    tasks: list[dict[str, Any]],
+    *,
+    search_filter: str,
+) -> list[dict[str, Any]]:
+    filtered_tasks = tasks
+
+    if search_filter:
+        search_folded = search_filter.casefold()
+        filtered_tasks = [
+            task
+            for task in filtered_tasks
+            if search_folded in str(task.get("worker_label", "")).casefold()
+            or search_folded
+            in str(
+                task.get("info_filter_text", task.get("info_label", "")),
+            )
+        ]
+
+    return filtered_tasks
+
+
+def _task_table_state(
+    request: _ViewContext,
+    *,
+    run: dict[str, Any],
+    show_task: int,
+    chi2: float,
+) -> dict[str, Any]:
     approver = request.has_permission("approve_run")
     tasks, show_pentanomial, show_residual = build_tasks_rows(
         run,
@@ -2139,71 +2890,224 @@ def tests_tasks(request):
         is_approver=approver,
     )
 
+    raw_sort = request.params.get("sort")
+    if raw_sort is None:
+        raw_sort = _tasks_cookie_value(request, "tasks_sort")
+    sort_param = str(raw_sort).strip().lower() or _TASKS_DEFAULT_SORT
+    if sort_param not in _TASKS_SORT_MAP:
+        sort_param = _TASKS_DEFAULT_SORT
+
+    sort_key, default_reverse = _TASKS_SORT_MAP[sort_param]
+    order_param, reverse = _normalize_sort_order(
+        request.params.get("order")
+        if request.params.get("order") is not None
+        else _tasks_cookie_value(request, "tasks_order"),
+        default_reverse=default_reverse,
+    )
+
+    raw_view = request.params.get("view")
+    if raw_view is None:
+        raw_view = _tasks_cookie_value(request, "tasks_view")
+    view_param = _normalize_view_mode(raw_view or "paged")
+
+    query_filter = _task_filter_value(
+        request,
+        param_name="q",
+        cookie_name="tasks_q",
+    )
+
+    tasks.sort(
+        key=lambda row: (
+            _tasks_sort_value(row, sort_key),
+            row.get("task_id", 0),
+        ),
+        reverse=reverse,
+    )
+
+    tasks = _filter_task_rows(
+        tasks,
+        search_filter=query_filter,
+    )
+
+    valid_show_task = (
+        show_task if any(task.get("task_id") == show_task for task in tasks) else -1
+    )
+    page_idx = _page_index_from_params(request.params)
+    num_tasks = len(tasks)
+    is_truncated = False
+
+    if view_param == "all":
+        if num_tasks > _TASKS_MAX_ALL:
+            tasks = tasks[:_TASKS_MAX_ALL]
+            is_truncated = True
+    else:
+        if request.params.get("page") is None and valid_show_task != -1:
+            highlighted_index = next(
+                index
+                for index, task in enumerate(tasks)
+                if task.get("task_id") == valid_show_task
+            )
+            page_idx = highlighted_index // _TASKS_PAGE_SIZE
+        page_idx = _clamp_page_index(
+            page_idx,
+            total_count=num_tasks,
+            page_size=_TASKS_PAGE_SIZE,
+        )
+        start = page_idx * _TASKS_PAGE_SIZE
+        tasks = tasks[start : start + _TASKS_PAGE_SIZE]
+
+    run_id = str(run["_id"])
+    query_params = _tasks_query_string(
+        sort_param=sort_param,
+        order_param=order_param,
+        query_filter=query_filter,
+        view=view_param,
+    )
+    pages = (
+        pagination(page_idx, num_tasks, _TASKS_PAGE_SIZE, query_params)
+        if view_param == "paged"
+        else []
+    )
+    for page in pages:
+        page_url = str(page.get("url", ""))
+        if page_url.startswith("?"):
+            page["url"] = f"/tests/tasks/{run_id}{page_url}&show_task={show_task}"
+
     return {
         "run": run,
+        "run_id": run_id,
         "approver": approver,
-        "show_task": show_task,
+        "show_task": valid_show_task,
         "chi2": chi2,
         "tasks": tasks,
         "show_pentanomial": show_pentanomial,
         "show_residual": show_residual,
+        "sort": sort_param,
+        "order": order_param,
+        "q": query_filter,
+        "view": view_param,
+        "current_page": page_idx + 1,
+        "pages": pages,
+        "num_tasks": num_tasks,
+        "max_all": _TASKS_MAX_ALL,
+        "is_truncated": is_truncated,
     }
 
 
-def tests_machines(request):
-    def _clip_long(text: str, max_length: int = 20) -> str:
-        if len(text) > max_length:
-            return text[:max_length] + "..."
-        return text
-
-    machines_list = request.rundb.get_machines()
-    machines = []
-    for machine in machines_list:
-        gcc_version = ".".join(str(m) for m in machine.get("gcc_version", []))
-        compiler = machine.get("compiler", "g++")
-        python_version = ".".join(str(m) for m in machine.get("python_version", []))
-        version = str(machine.get("version", "")) + "*" * machine.get("modified", False)
-        worker_short = machine.get("unique_key", "").split("-")[0]
-        worker_url = f"/workers/{worker_name(machine, short=True)}"
-        formatted_time_ago = format_time_ago(machine["last_updated"])
-        sort_value_time_ago = -machine["last_updated"].timestamp()
-        branch = machine["run"]["args"]["new_tag"]
-        task_id = str(machine["task_id"])
-        run_id = str(machine["run"]["_id"])
-
-        machines.append(
-            {
-                "username": machine["username"],
-                "country_code": machine.get("country_code", "").lower(),
-                "concurrency": machine["concurrency"],
-                "worker_url": worker_url,
-                "worker_short": worker_short,
-                "nps_m": f"{machine['nps'] / 1000000:.2f}",
-                "max_memory": machine["max_memory"],
-                "system": machine["uname"],
-                "worker_arch": machine["worker_arch"],
-                "compiler_label": f"{compiler} {gcc_version}",
-                "python_label": python_version,
-                "version_label": version,
-                "run_url": f"/tests/view/{run_id}?show_task={task_id}",
-                "run_label": f"{_clip_long(branch)}/{task_id}",
-                "last_active_label": formatted_time_ago,
-                "last_active_sort": sort_value_time_ago,
-            }
-        )
-
-    return {"machines_list": machines_list, "machines": machines}
+def _set_tasks_cookie(
+    request: _ViewContext,
+    name: str,
+    value: str,
+    max_age_seconds: int,
+) -> None:
+    cookie_value = (
+        f"{name}={quote(value, safe='')}; path=/; max-age={max_age_seconds}; "
+        "SameSite=Lax"
+    )
+    request.response_headerlist.append(
+        (
+            "Set-Cookie",
+            cookie_value,
+        ),
+    )
 
 
-def tests_view(request):
+def _set_tasks_cookies(
+    request: _ViewContext,
+    state: dict[str, Any],
+) -> None:
+    cookie_max_age = PERSISTENT_UI_COOKIE_MAX_AGE_SECONDS
+    _set_tasks_cookie(request, "tasks_sort", str(state["sort"]), cookie_max_age)
+    _set_tasks_cookie(request, "tasks_order", str(state["order"]), cookie_max_age)
+    _set_tasks_cookie(request, "tasks_view", str(state["view"]), cookie_max_age)
+    _set_tasks_cookie(request, "tasks_q", str(state["q"]), cookie_max_age)
+
+
+def _tasks_query_string(
+    *,
+    sort_param: str,
+    order_param: str,
+    query_filter: str,
+    view: str,
+) -> str:
+    _, default_reverse = _TASKS_SORT_MAP[_TASKS_DEFAULT_SORT]
+    default_order = "desc" if default_reverse else "asc"
+
+    params: list[tuple[str, str]] = []
+    if sort_param != _TASKS_DEFAULT_SORT:
+        params.append(("sort", sort_param))
+    if order_param != default_order:
+        params.append(("order", order_param))
+    if query_filter:
+        params.append(("q", query_filter))
+    if view == "all":
+        params.append(("view", "all"))
+    return _build_query_string(params)
+
+
+def _tasks_sort_value(
+    row: dict[str, Any],
+    sort_key: str,
+) -> int | float | str | tuple[int, int, int, int, int]:
+    value = row.get(sort_key, "")
+    if sort_key == "task_id":
+        return int(value) if isinstance(value, int) else 0
+
+    if sort_key in (
+        "crashes",
+        "time_losses",
+        "wins",
+        "losses",
+        "draws",
+        "played_sort",
+    ):
+        fallback: int | float | str | tuple[int, int, int, int, int] = -1
+    elif sort_key in ("last_updated_sort", "residual_sort"):
+        fallback = float("-inf")
+    elif sort_key == "pentanomial_sort":
+        fallback = (0, 0, 0, 0, 0)
+    else:
+        return str(value).lower()
+
+    if isinstance(fallback, tuple):
+        return value if isinstance(value, tuple) else fallback
+    if isinstance(fallback, float):
+        return float(value) if isinstance(value, int | float) else fallback
+    return value if isinstance(value, int) else fallback
+
+
+def tests_tasks(request: _ViewContext) -> dict[str, Any] | Response:
+    run = request.rundb.get_run(request.matchdict["id"])
+    if run is None:
+        raise StarletteHTTPException(status_code=404)
+    chi2 = get_chi2(run["tasks"])
+    show_task = _parse_show_task_param(request)
+
+    context = _task_table_state(
+        request,
+        run=run,
+        show_task=show_task,
+        chi2=chi2,
+    )
+    _set_tasks_cookies(request, context)
+
+    response = _render_hx_fragment(
+        request,
+        "tasks_content_fragment.html.j2",
+        context,
+    )
+    return response or context
+
+
+def tests_view(request: _ViewContext) -> dict[str, Any] | RedirectResponse:  # noqa: C901, PLR0912, PLR0915
     run = request.rundb.get_run(request.matchdict["id"])
     if run is None:
         raise StarletteHTTPException(status_code=404)
     run_id = str(run["_id"])
     follow = 1 if "follow" in request.params else 0
-    run_args = [("id", str(run["_id"]), "")]
+    run_args: list[_RunArg] = [("id", str(run["_id"]), "")]
     if run.get("rescheduled_from"):
-        run_args.append(("rescheduled_from", run["rescheduled_from"], ""))
+        run_args.append(("rescheduled_from", str(run["rescheduled_from"]), ""))
 
     for name in (
         "new_tag",
@@ -2248,8 +3152,9 @@ def tests_view(request):
             if value != "":
                 filtered_arches = list(
                     filter(
-                        lambda x: regex.search(value, x) is not None, supported_arches
-                    )
+                        lambda x: regex.search(value, x) is not None,
+                        supported_arches,
+                    ),
                 )
                 value += "  (" + ", ".join(filtered_arches) + ")"
             else:
@@ -2265,7 +3170,9 @@ def tests_view(request):
             value = ", ".join(value)
 
         if name == "sprt" and value != "-":
-            value = "elo0: {:.2f} alpha: {:.2f} elo1: {:.2f} beta: {:.2f} state: {} ({})".format(
+            value = (
+                "elo0: {:.2f} alpha: {:.2f} elo1: {:.2f} beta: {:.2f} state: {} ({})"
+            ).format(
                 value["elo0"],
                 value["alpha"],
                 value["elo1"],
@@ -2276,14 +3183,12 @@ def tests_view(request):
 
         if name == "spsa" and value != "-":
             iter_local = value["iter"] + 1  # start from 1 to avoid division by zero
-            A = value["A"]
+            A = value["A"]  # noqa: N806
             alpha = value["alpha"]
             gamma = value["gamma"]
-            summary = "iter: {:d}, A: {:d}, alpha: {:0.3f}, gamma: {:0.3f}".format(
-                iter_local,
-                A,
-                alpha,
-                gamma,
+            summary = (
+                f"iter: {iter_local:d}, A: {A:d},"
+                f" alpha: {alpha:0.3f}, gamma: {gamma:0.3f}"
             )
             params = value["params"]
             value = [summary]
@@ -2292,47 +3197,54 @@ def tests_view(request):
                     c_iter = p["c"] / (iter_local**gamma)
                     r_iter = p["a"] / (A + iter_local) ** alpha / c_iter**2
                 except (ArithmeticError, TypeError, ValueError) as e:
-                    print(
+                    logger.warning(
                         "Invalid SPSA param state while rendering "
-                        f"run {run['_id']} (iter={iter_local}, "
-                        f"param={p.get('name', '<unknown>')}): {str(e)}"
+                        "run %s (iter=%d, param=%s): %s",
+                        run["_id"],
+                        iter_local,
+                        p.get("name", "<unknown>"),
+                        e,
                     )
                     c_iter = float("nan")
                     r_iter = float("nan")
                 value.append(
-                    [
+                    [  # type: ignore[invalid-argument-type]
                         p["name"],
                         "{:.2f}".format(p["theta"]),
-                        int(p["start"]),
-                        int(p["min"]),
-                        int(p["max"]),
-                        "{:.3f}".format(c_iter),
+                        str(int(p["start"])),
+                        str(int(p["min"])),
+                        str(int(p["max"])),
+                        f"{c_iter:.3f}",
                         "{:.3f}".format(p["c_end"]),
-                        "{:.2e}".format(r_iter),
+                        f"{r_iter:.2e}",
                         "{:.2e}".format(p["r_end"]),
-                    ]
+                    ],
                 )
 
         tests_repo_ = tests_repo(run)
         user, repo = gh.parse_repo(tests_repo_)
         if name == "tests_repo":
             value = tests_repo_
-            url = value
+            url = tests_repo_
 
         if name == "master_repo":
-            url = value
+            url = str(value)
 
         if name == "new_tag":
             url = gh.commit_url(
-                user=user, repo=repo, branch=run["args"]["resolved_new"]
+                user=user,
+                repo=repo,
+                branch=run["args"]["resolved_new"],
             )
         elif name == "base_tag":
             url = gh.commit_url(
-                user=user, repo=repo, branch=run["args"]["resolved_base"]
+                user=user,
+                repo=repo,
+                branch=run["args"]["resolved_base"],
             )
 
         if name == "spsa":
-            run_args.append(("spsa", value, ""))
+            run_args.append(("spsa", value, ""))  # type: ignore[invalid-argument-type]
         else:
             run_args.append((name, str(value), url))
 
@@ -2345,25 +3257,25 @@ def tests_view(request):
 
     chi2 = get_chi2(run["tasks"])
 
-    try:
-        show_task = int(request.params.get("show_task", -1))
-    except ValueError:
-        show_task = -1
-    if show_task >= len(run["tasks"]) or show_task < -1:
-        show_task = -1
+    show_task = _parse_show_task_param(request)
+
+    tasks_table_context = _task_table_state(
+        request,
+        run=run,
+        show_task=show_task,
+        chi2=chi2,
+    )
 
     same_user = is_same_user(request, run)
 
     spsa_data = request.rundb.spsa_handler.get_spsa_data(run_id)
 
     same_options = True
-    try:
+    with contextlib.suppress(Exception):
         # use sanitize_options for compatibility with old tests
         same_options = sanitize_options(run["args"]["new_options"]) == sanitize_options(
-            run["args"]["base_options"]
+            run["args"]["base_options"],
         )
-    except Exception:
-        pass
 
     notes = []
     if (
@@ -2375,7 +3287,7 @@ def tests_view(request):
         notes.append("this test has been deleted")
 
     warnings = []
-    if run["args"]["throughput"] > 100:
+    if run["args"]["throughput"] > _THROUGHPUT_NORMAL_LIMIT:
         warnings.append("throughput exceeds the normal limit")
     if run["args"]["priority"] > 0:
         warnings.append("priority exceeds the normal limit")
@@ -2394,15 +3306,18 @@ def tests_view(request):
         warnings.append("this test has a non-trivial arch filter")
     if run["args"].get("compiler", "") != "":
         warnings.append("this test has a pinned compiler")
-    book_exits = request.rundb.books.get(run["args"]["book"], {}).get("total", 100000)
-    if book_exits < 100000:
+    book_exits = request.rundb.books.get(
+        run["args"]["book"],
+        {},
+    ).get("total", _MIN_BOOK_EXITS)
+    if book_exits < _MIN_BOOK_EXITS:
         warnings.append(f"this test uses a small book with only {book_exits} exits")
     if "master_repo" in run["args"]:  # if present then it is non-standard
         warnings.append(
-            "the developer repository is not forked from official-stockfish/Stockfish"
+            "the developer repository is not forked from official-stockfish/Stockfish",
         )
 
-    def allow_github_api_calls():
+    def allow_github_api_calls() -> bool:
         # Avoid making pointless GitHub api calls on behalf of
         # crawlers
         if "master_repo" in run["args"]:  # if present then it is non-standard
@@ -2412,15 +3327,13 @@ def tests_view(request):
         now = datetime.now(UTC)
         # Period should be short enough so that it can be
         # served from the api cache!
-        if (now - run["last_updated"]).days > 30:
-            return False
-        return True
+        return (now - run["last_updated"]).days <= _RUN_AGE_GITHUB_API_MAX_DAYS
 
     try:
         user, repo = gh.parse_repo(gh.normalize_repo(tests_repo(run)))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         user, repo = gh.parse_repo(tests_repo(run))
-        print(f"Unable to normalize_repo: {str(e)}")
+        logger.warning("Unable to normalize_repo: %s", e)
 
     anchor_url = gh.compare_branches_url(
         user1="official-stockfish",
@@ -2432,7 +3345,9 @@ def tests_view(request):
     # autoescape. Build it as Markup so the anchor tag is not escaped.
     # Markup.format will HTML-escape attribute values (defense in depth).
     anchor = Markup(
-        '<a class="alert-link" href="{}" target="_blank" rel="noopener noreferrer">base diff</a>'
+        '<a class="alert-link" href="{}"'
+        ' target="_blank" rel="noopener noreferrer">'
+        "base diff</a>",
     ).format(anchor_url)
     use_3dot_diff = False
     if "spsa" not in run["args"] and allow_github_api_calls():
@@ -2447,7 +3362,7 @@ def tests_view(request):
                     ignore_rate_limit=irl,
                 ):
                     warnings.append(
-                        Markup("base is not an ancestor of master: {}").format(anchor)
+                        Markup("base is not an ancestor of master: {}").format(anchor),
                     )
                 elif not gh.is_ancestor(
                     user1=user,
@@ -2465,7 +3380,7 @@ def tests_view(request):
                     )
                     if merge_base_commit != run["args"]["resolved_base"]:
                         warnings.append(
-                            "base is not the latest common ancestor of new and master"
+                            "base is not the latest common ancestor of new and master",
                         )
             use_3dot_diff = gh.is_ancestor(
                 user1=user,
@@ -2473,8 +3388,8 @@ def tests_view(request):
                 sha2=run["args"]["resolved_new"],
                 ignore_rate_limit=irl,
             )
-        except Exception as e:
-            print(f"Exception processing api calls for {run['_id']}: {str(e)}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Exception processing api calls for %s: %s", run["_id"], e)
 
     return {
         "run": run,
@@ -2483,10 +3398,23 @@ def tests_view(request):
         "approver": request.has_permission("approve_run"),
         "chi2": chi2,
         "totals": "({} active worker{} with {} core{})".format(
-            active, ("s" if active != 1 else ""), cores, ("s" if cores != 1 else "")
+            active,
+            ("s" if active != 1 else ""),
+            cores,
+            ("s" if cores != 1 else ""),
         ),
-        "tasks_shown": show_task != -1 or request.cookies.get("tasks_state") == "Hide",
-        "show_task": show_task,
+        "tasks_shown": tasks_table_context["show_task"] != -1
+        or request.cookies.get("tasks_state") == "Hide",
+        "show_task": tasks_table_context["show_task"],
+        "tasks_sort": tasks_table_context["sort"],
+        "tasks_order": tasks_table_context["order"],
+        "tasks_view": tasks_table_context["view"],
+        "tasks_page": tasks_table_context["current_page"],
+        "tasks_q": tasks_table_context["q"],
+        "tasks_pages": tasks_table_context["pages"],
+        "tasks_num_tasks": tasks_table_context["num_tasks"],
+        "tasks_max_all": tasks_table_context["max_all"],
+        "tasks_is_truncated": tasks_table_context["is_truncated"],
         "follow": follow,
         "can_modify_run": can_modify_run(request, run),
         "same_user": same_user,
@@ -2500,276 +3428,12 @@ def tests_view(request):
     }
 
 
-def get_paginated_finished_runs(request):
-    username = request.matchdict.get("username", "")
-    success_only = request.params.get("success_only", False)
-    yellow_only = request.params.get("yellow_only", False)
-    ltc_only = request.params.get("ltc_only", False)
-
-    page_param = request.params.get("page", "")
-    page_idx = max(0, int(page_param) - 1) if page_param.isdigit() else 0
-    page_size = 25
-
-    finished_runs, num_finished_runs = request.rundb.get_finished_runs(
-        username=username,
-        success_only=success_only,
-        yellow_only=yellow_only,
-        ltc_only=ltc_only,
-        skip=page_idx * page_size,
-        limit=page_size,
-    )
-
-    query_params = ""
-    if success_only:
-        query_params += "&success_only=1"
-    if yellow_only:
-        query_params += "&yellow_only=1"
-    if ltc_only:
-        query_params += "&ltc_only=1"
-    pages = pagination(page_idx, num_finished_runs, page_size, query_params)
-
-    failed_runs = []
-    if page_idx == 0:
-        for run in finished_runs:
-            # Look for failed runs
-            if "failed" in run and run["failed"]:
-                failed_runs.append(run)
-
-    filters = {
-        "success_only": bool(success_only),
-        "yellow_only": bool(yellow_only),
-        "ltc_only": bool(ltc_only),
-    }
-    title_suffix = ""
-    if filters["success_only"]:
-        title_suffix = " - Greens"
-    elif filters["yellow_only"]:
-        title_suffix = " - Yellows"
-    elif filters["ltc_only"]:
-        title_suffix = " - LTC"
-
-    return {
-        "finished_runs": finished_runs,
-        "finished_runs_pages": pages,
-        "num_finished_runs": num_finished_runs,
-        "failed_runs": failed_runs,
-        "page_idx": page_idx,
-        "filters": filters,
-        "title_suffix": title_suffix,
-    }
-
-
-def _build_toggle_states(request, toggle_names):
-    return {name: request.cookies.get(f"{name}_state", "Show") for name in toggle_names}
-
-
-def _build_run_tables_context(
-    request,
-    *,
-    runs,
-    failed_runs,
-    finished_runs,
-    num_finished_runs,
-    finished_runs_pages,
-    page_idx,
-    username="",
-):
-    runs = runs or {"pending": [], "active": []}
-    pending_runs = [r for r in runs.get("pending", []) if not r.get("approved")]
-    paused_runs = [r for r in runs.get("pending", []) if r.get("approved")]
-    active_runs = list(runs.get("active", []))
-    prefix = run_tables_prefix(username)
-    toggle_names = [prefix + "finished"]
-    if page_idx == 0:
-        toggle_names = [
-            prefix + "pending",
-            prefix + "paused",
-            prefix + "failed",
-            prefix + "active",
-            prefix + "finished",
-        ]
-    toggle_states = _build_toggle_states(request, toggle_names)
-    finished_title_text = (
-        f"{username + ' - ' if username else ''}Finished Tests"
-        f" - page {page_idx + 1} | Stockfish Testing"
-    )
-
-    return {
-        "pending_approval_runs": build_run_table_rows(
-            pending_runs,
-            allow_github_api_calls=False,
-        ),
-        "paused_runs": build_run_table_rows(
-            paused_runs,
-            allow_github_api_calls=False,
-        ),
-        "failed_runs": build_run_table_rows(
-            failed_runs,
-            allow_github_api_calls=False,
-        ),
-        "active_runs": build_run_table_rows(
-            active_runs,
-            allow_github_api_calls=False,
-        ),
-        "finished_runs": build_run_table_rows(
-            finished_runs,
-            allow_github_api_calls=False,
-        ),
-        "num_finished_runs": num_finished_runs,
-        "finished_runs_pages": finished_runs_pages,
-        "page_idx": page_idx,
-        "prefix": prefix,
-        "toggle_states": toggle_states,
-        "finished_title_text": finished_title_text,
-        "show_gauge": False,
-    }
-
-
-# === Run lists + homepage ===
-def tests_finished(request):
-    context = get_paginated_finished_runs(request)
-    page_idx = context.get("page_idx", 0)
-    title_suffix = context.get("title_suffix", "")
-    title_text = (
-        f"Finished Tests{title_suffix} - page {page_idx + 1} | Stockfish Testing"
-    )
-    return {
-        **context,
-        "query_params": request.query_params,
-        "finished_runs": build_run_table_rows(
-            context.get("finished_runs", []),
-            allow_github_api_calls=False,
-        ),
-        "failed_runs": build_run_table_rows(
-            context.get("failed_runs", []),
-            allow_github_api_calls=False,
-        ),
-        "title": title_suffix,
-        "title_text": title_text,
-        "show_gauge": False,
-    }
-
-
-def tests_user(request):
-    request.response_headerlist.extend(
-        (
-            ("Cache-Control", "no-store"),
-            ("Expires", "0"),
-        )
-    )
-    username = request.matchdict.get("username", "")
-    user_data = request.userdb.get_user(username)
-    if user_data is None:
-        raise StarletteHTTPException(status_code=404)
-    is_approver = request.has_permission("approve_run")
-    finished_context = get_paginated_finished_runs(request)
-    response = {
-        **finished_context,
-        "username": username,
-        "is_approver": is_approver,
-    }
-    page_param = request.params.get("page", "")
-    if not page_param.isdigit() or int(page_param) <= 1:
-        runs = request.rundb.aggregate_unfinished_runs(username=username)[0]
-        response["run_tables_ctx"] = _build_run_tables_context(
-            request,
-            runs=runs,
-            failed_runs=finished_context.get("failed_runs", []),
-            finished_runs=finished_context.get("finished_runs", []),
-            num_finished_runs=finished_context.get("num_finished_runs", 0),
-            finished_runs_pages=finished_context.get("finished_runs_pages", []),
-            page_idx=finished_context.get("page_idx", 0),
-            username=username,
-        )
-    else:
-        response["run_tables_ctx"] = _build_run_tables_context(
-            request,
-            runs=None,
-            failed_runs=finished_context.get("failed_runs", []),
-            finished_runs=finished_context.get("finished_runs", []),
-            num_finished_runs=finished_context.get("num_finished_runs", 0),
-            finished_runs_pages=finished_context.get("finished_runs_pages", []),
-            page_idx=finished_context.get("page_idx", 0),
-            username=username,
-        )
-    # page 2 and beyond only show finished test results
-    return response
-
-
-def homepage_results(request):
-    # Get updated results for unfinished runs + finished runs
-
-    (
-        runs,
-        pending_hours,
-        cores,
-        nps,
-        games_per_minute,
-        machines_count,
-    ) = request.rundb.aggregate_unfinished_runs()
-    finished_context = get_paginated_finished_runs(request)
-    run_tables_ctx = _build_run_tables_context(
-        request,
-        runs=runs,
-        failed_runs=finished_context.get("failed_runs", []),
-        finished_runs=finished_context.get("finished_runs", []),
-        num_finished_runs=finished_context.get("num_finished_runs", 0),
-        finished_runs_pages=finished_context.get("finished_runs_pages", []),
-        page_idx=finished_context.get("page_idx", 0),
-    )
-    return {
-        **finished_context,
-        "runs": runs,
-        "run_tables_ctx": run_tables_ctx,
-        "machines_count": machines_count,
-        "pending_hours": "{:.1f}".format(pending_hours),
-        "cores": cores,
-        "nps": nps,
-        "nps_m": f"{nps / 1000000:.0f}M",
-        "games_per_minute": int(games_per_minute),
-        "height": f"{machines_count * 37}px",
-        "min_height": "37px",
-        "max_height": "34.7vh",
-    }
-
-
-def tests(request):
-    request.response_headerlist.extend(
-        (
-            ("Cache-Control", "no-store"),
-            ("Expires", "0"),
-        )
-    )
-    page_param = request.params.get("page", "")
-    if page_param.isdigit() and int(page_param) > 1:
-        # page 2 and beyond only show finished test results
-        finished_context = get_paginated_finished_runs(request)
-        return {
-            **finished_context,
-            "run_tables_ctx": _build_run_tables_context(
-                request,
-                runs=None,
-                failed_runs=finished_context.get("failed_runs", []),
-                finished_runs=finished_context.get("finished_runs", []),
-                num_finished_runs=finished_context.get("num_finished_runs", 0),
-                finished_runs_pages=finished_context.get("finished_runs_pages", []),
-                page_idx=finished_context.get("page_idx", 0),
-            ),
-        }
-
-    last_tests = homepage_results(request)
-
-    return {
-        **last_tests,
-        "machines_shown": request.cookies.get("machines_state") == "Hide",
-    }
-
-
-# === Router registration ===
+# === Router Registration ===
 
 # Each entry: (view_function, path, config_dict)
 # Config keys: renderer, require_csrf, require_primary, request_method, http_cache
-# Special: direct=True bypasses _dispatch_view (for pure redirects, no DB/session needed)
+# Special: direct=True bypasses _dispatch_view
+# (for pure redirects, no DB/session needed)
 _VIEW_ROUTES = [
     (home, "/", {"direct": True}),
     (
@@ -2800,6 +3464,12 @@ _VIEW_ROUTES = [
     (nns, "/nns", {"renderer": "nns.html.j2"}),
     (sprt_calc, "/sprt_calc", {"renderer": "sprt_calc.html.j2"}),
     (rate_limits, "/rate_limits", {"renderer": "rate_limits.html.j2"}),
+    (rate_limits_server, "/rate_limits/server", {}),
+    (
+        user_management_pending_count,
+        "/user_management/pending_count",
+        {"renderer": "pending_users_nav_fragment.html.j2"},
+    ),
     (actions, "/actions", {"renderer": "actions.html.j2"}),
     (user_management, "/user_management", {"renderer": "user_management.html.j2"}),
     (user, "/user/{username}", {"renderer": "user.html.j2"}),
@@ -2845,12 +3515,27 @@ _VIEW_ROUTES = [
         {"require_csrf": True, "request_method": "POST", "require_primary": True},
     ),
     (tests_live_elo, "/tests/live_elo/{id}", {"renderer": "tests_live_elo.html.j2"}),
+    (
+        live_elo_update,
+        "/tests/live_elo_update/{id}",
+        {"renderer": "live_elo_fragment.html.j2"},
+    ),
+    (tests_elo, "/tests/elo/{id}", {"renderer": "elo_results_fragment.html.j2"}),
+    (
+        tests_elo_batch,
+        "/tests/elo_batch",
+        {"renderer": "elo_batch_fragment.html.j2"},
+    ),
     (tests_stats, "/tests/stats/{id}", {"renderer": "tests_stats.html.j2"}),
-    (tests_tasks, "/tests/tasks/{id}", {"renderer": "tasks.html.j2"}),
+    (
+        tests_tasks,
+        "/tests/tasks/{id}",
+        {"renderer": "tasks_content_fragment.html.j2"},
+    ),
     (
         tests_machines,
         "/tests/machines",
-        {"renderer": "machines.html.j2", "http_cache": 10},
+        {"renderer": "machines_fragment.html.j2", "http_cache": 10},
     ),
     (tests_view, "/tests/view/{id}", {"renderer": "tests_view.html.j2"}),
     (tests_finished, "/tests/finished", {"renderer": "tests_finished.html.j2"}),
@@ -2859,8 +3544,11 @@ _VIEW_ROUTES = [
 ]
 
 
-def _make_endpoint(fn, cfg_local):
-    async def endpoint(request: Request):
+def _make_endpoint(
+    fn: Callable[..., Any],
+    cfg_local: dict[str, Any],
+) -> Callable[..., Any]:
+    async def endpoint(request: Request) -> Response:
         return await _dispatch_view(
             fn,
             cfg_local,
@@ -2871,7 +3559,7 @@ def _make_endpoint(fn, cfg_local):
     return endpoint
 
 
-def _normalize_methods(methods):
+def _normalize_methods(methods: str | tuple[str, ...] | list[str] | None) -> list[str]:
     if methods is None:
         return ["GET", "POST"]
     if isinstance(methods, str):
@@ -2879,9 +3567,9 @@ def _normalize_methods(methods):
     return list(methods)
 
 
-def _register_view_routes():
+def _register_view_routes() -> None:
     for fn, path, cfg in _VIEW_ROUTES:
-        methods = _normalize_methods(cfg.get("request_method"))
+        methods = _normalize_methods(cfg.get("request_method"))  # type: ignore[invalid-argument-type]
         endpoint = fn if cfg.get("direct") else _make_endpoint(fn, cfg)
         router.add_api_route(
             path,
