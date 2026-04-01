@@ -209,11 +209,11 @@ Known gaps documented for future iterations:
 
 ## Template catalog
 
-The live template inventory contains **48** Jinja templates:
+The live template inventory contains **53** Jinja templates:
 
 - **1** base layout template
 - **19** full-page templates that extend `base.html.j2`
-- **28** non-base templates used as htmx fragments or shared partials
+- **33** non-base templates used as htmx fragments or shared partials
 
 ### Base layout template
 
@@ -256,9 +256,9 @@ fragments; others are shared partials included by page or fragment templates.
 | `active_run_filters_fragment.html.j2` | htmx controls fragment | Swaps `#active-run-filters` |
 | `contributors_content_fragment.html.j2` | htmx content fragment | Swaps `#contributors-content`; includes hidden-input OOB sync |
 | `contributors_rows_fragment.html.j2` | shared row partial | Included by `contributors_content_fragment.html.j2` |
-| `elo_batch_fragment.html.j2` | OOB poll fragment | Poll response for homepage ELO batch updates |
+| `tests_run_tables_fragment.html.j2` | OOB poll fragment | Shared run-table OOB payload for `/tests?live=run_tables` and `/tests/user/{username}?live=run_tables` |
 | `elo_results.html.j2` | shared display partial | Included where ELO summary markup is rendered |
-| `elo_results_fragment.html.j2` | OOB poll fragment | Poll response for live ELO summary updates |
+| `elo_results_fragment.html.j2` | shared OOB partial | Included by `tests_view_detail_fragment.html.j2` for live ELO summary, status, and task-total updates |
 | `homepage_stats_fragment.html.j2` | OOB summary fragment | Updates homepage stat targets |
 | `live_elo_fragment.html.j2` | OOB poll fragment | Poll response for live ELO page updates |
 | `machines_fragment.html.j2` | htmx content fragment | Swaps `#machines` and updates `#workers-count` OOB |
@@ -275,6 +275,11 @@ fragments; others are shared partials included by page or fragment templates.
 | `tests_finished_content_fragment.html.j2` | shared full-page partial | Included by `tests_finished.html.j2` |
 | `tests_finished_results_fragment.html.j2` | htmx results fragment | Swaps `#tests-finished-content`; can update tab wrapper OOB |
 | `tests_stats_content_fragment.html.j2` | polled content fragment | Swaps `#tests-stats-content` |
+| `tests_view_detail_fragment.html.j2` | OOB poll fragment | Poll response for live detail-page summary + detail updates |
+| `tests_view_details_section.html.j2` | shared detail partial | Included by `tests_view.html.j2` and `tests_view_detail_fragment.html.j2` |
+| `tests_view_spsa_section.html.j2` | shared SPSA partial | Included by `tests_view.html.j2` |
+| `tests_view_stats_section.html.j2` | shared stats partial | Included by `tests_view.html.j2` and `tests_view_detail_fragment.html.j2` |
+| `tests_view_time_section.html.j2` | shared time partial | Included by `tests_view.html.j2` and `tests_view_detail_fragment.html.j2` |
 | `tests_user_content_fragment.html.j2` | htmx content fragment | Swaps `#tests-user-content` |
 | `user_management_content_fragment.html.j2` | htmx content fragment | Swaps `#user-management-content`; includes hidden-input OOB sync |
 | `user_management_rows_fragment.html.j2` | shared row partial | Included by `user_management_content_fragment.html.j2` |
@@ -377,8 +382,8 @@ Behavior notes:
 - Homepage polling keeps including the current filter form state, so fragment
    refreshes continue while the `q` search filter is active.
 - The hidden homepage Workers header is refreshed from the current machine
-  snapshot during `/tests` and `/tests/elo_batch` rendering, so a collapsed
-  panel still shows a live filtered count.
+   snapshot during `/tests` and page-1 same-route live run-table fragment
+   rendering, so a collapsed panel still shows a live filtered count.
 
 Each machine row: `username`, `country_code`, `concurrency`, `worker_url`,
 `worker_short`, `nps_m` (preformatted string), `max_memory`, `system`,
@@ -611,7 +616,7 @@ Rendered structure notes:
 Page shell for `/tests/stats/{id}`. Includes the shared stats content fragment and,
 for unfinished non-SPSA runs, a visibility-aware htmx poller targeting
 `#tests-stats-content` using the dedicated raw-statistics poll cadence
-`poll.stats_detail`.
+`poll.tests_stats`.
 
 | Key | Type |
 |-----|------|
@@ -654,7 +659,8 @@ Rendered structure:
 | `page_title` | string |
 | `approver` | bool |
 | `chi2` | value |
-| `totals` | string (active workers summary) |
+| `run_status_label` | string |
+| `tasks_totals` | string (active workers summary) |
 | `tasks_shown` | bool |
 | `show_task` | int |
 | `follow` | int |
@@ -668,14 +674,28 @@ Rendered structure:
 | `use_3dot_diff` | bool |
 | `allow_github_api_calls` | bool |
 
-Detail-page ELO polling contract:
+Detail-page merged live polling contract:
 
-- Unfinished runs render a visibility-aware htmx poller targeting
-   `/tests/elo/{id}?expected=<status>`.
-- The `expected` query param must match the page's current run status label:
-   `active`, `paused`, or `pending`.
-- The page-level `_status` Jinja expression is the canonical source for both
-   the visible status label and the poller's expected state.
+- Unfinished runs render one visibility-aware htmx poller targeting
+   `/tests/view/{id}/detail`.
+- The poller includes `#tests-view-detail-expected`, a hidden server-owned
+   input carrying the current canonical `expected` status.
+- The poller uses `hx-swap="none"` and the dedicated cadence
+   `poll.tests_view_detail`.
+- The submitted `expected` value must match the page's canonical
+   `run_status_label`: `active`, `paused`, or `pending`.
+- The shared OOB targets are `#elo-<run_id>`, `#run-status-<run_id>`,
+   `#tasks-totals`, `#tests-view-details`, `#tests-view-time`, and either
+   `#tests-view-stats` or the embedded `#spsa-data-<run_id>` payload depending
+   on the run type.
+- `tests_view_detail_fragment.html.j2` OOB-refreshes the hidden expected-state
+   input alongside the visible status label so paused/pending transitions can
+   settle back to `204` on the next poll.
+- SPSA runs keep the chart shell stable in `tests_view.html.j2`; live detail
+   refreshes update only the embedded `application/json` payload contents so
+   `static/js/spsa.js` can keep the payload node mounted, skip unchanged
+   redraws, and redraw changed payloads without replacing the mounted chart
+   shell.
 
 Detail-page tasks loader contract:
 
@@ -698,6 +718,92 @@ Run-table row contract:
 - The Active row markup carries filter dimensions plus a source-order index for
    restoring the current server order after checkbox changes and OOB swaps; it
    does not use a row-parity contract.
+
+### `tests_view_detail_fragment.html.j2`
+
+Merged OOB poll fragment returned by `/tests/view/{id}/detail`. Composes the
+shared detail-page summary + detail sections with `hx-swap-oob` enabled.
+
+| Key | Type |
+|-----|------|
+| `run` | dict |
+| `run_status_label` | string |
+| `tasks_totals` | string |
+| `run_args` | list of tuples `(name, value, url)` |
+| `approver` | bool |
+| `chi2` | dict |
+| `document_size` | int |
+| `spsa_data` | dict or None |
+
+Rendered behavior:
+
+- always includes `elo_results_fragment.html.j2`
+- always includes `tests_view_details_section.html.j2`
+- always includes `tests_view_time_section.html.j2`
+- includes `tests_view_stats_section.html.j2` for non-SPSA runs
+- emits an OOB `#spsa-data-<run_id>` `application/json` payload update for
+   SPSA runs using `innerHTML` so the existing script node stays mounted
+
+### `tests_view_details_section.html.j2`
+
+Shared detail-table section used by `tests_view.html.j2` and the live detail
+fragment.
+
+| Key | Type |
+|-----|------|
+| `run` | dict |
+| `run_args` | list of tuples `(name, value, url)` |
+| `approver` | bool |
+| `document_size` | int |
+
+Rendered structure:
+
+- `#tests-view-details` root element
+- run argument rows, document size, actions link, raw statistics link when
+   applicable, and approver link when present
+
+### `tests_view_stats_section.html.j2`
+
+Shared compact chi-square block for the test detail page.
+
+| Key | Type |
+|-----|------|
+| `chi2` | dict |
+
+Rendered structure:
+
+- `#tests-view-stats` root element
+- compact `chi^2`, `dof`, and `p-value` table
+
+### `tests_view_time_section.html.j2`
+
+Shared time block for the test detail page.
+
+| Key | Type |
+|-----|------|
+| `run` | dict |
+
+Rendered structure:
+
+- `#tests-view-time` root element
+- start time and last updated rows
+
+### `tests_view_spsa_section.html.j2`
+
+Shared SPSA chart section for the test detail page.
+
+| Key | Type |
+|-----|------|
+| `run` | dict |
+| `spsa_data` | dict or None |
+
+Rendered structure:
+
+- `#tests-view-spsa` root element
+- DOM-embedded `application/json` payload for the current SPSA state
+- `#spsa_history_scroll` retained scroll container
+- CSS-owned `#spsa_history_plot` shell for the fixed-size chart (Google Charts uses 1000x500; layout and scrolling handled by CSS and the scroll container)
+- chart toolbar and chart container used by `static/js/spsa.js`
 
 ### `user.html.j2`
 
@@ -805,7 +911,7 @@ submissions preserve the live table state.
 |-----|------|
 | `users` | list of contributor row dicts |
 
-### `elo_batch_fragment.html.j2`
+### `tests_run_tables_fragment.html.j2`
 
 | Key | Type | Description |
 |-----|------|-------------|
@@ -823,6 +929,8 @@ Behavior notes:
    the homepage shell and OOB fragment updates.
 
 ### `elo_results_fragment.html.j2`
+
+Shared OOB partial included by `tests_view_detail_fragment.html.j2`.
 
 | Key | Type |
 |-----|------|
@@ -877,8 +985,9 @@ label out of band so homepage polling, sorting, paging, and filters stay in
 sync without replacing the filter controls themselves.
 
 The machine rows come from the current server machine snapshot. The same
-snapshot is reused by `/tests` and `/tests/elo_batch` when they need to render a
-live filtered workers count while the table itself is collapsed.
+snapshot is reused by `/tests` and its page-1 same-route live run-table
+fragment when they need to render a live filtered workers count while the
+table itself is collapsed.
 
 ### `nns_content_fragment.html.j2`
 

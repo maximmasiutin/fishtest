@@ -19,8 +19,8 @@ server/
 |-- pyproject.toml           -- Package metadata, dependencies
 |-- fishtest/
 |   |-- app.py               -- ASGI application factory, lifespan, middleware, routers
-|   |-- api.py               -- Worker API router (22 endpoints)
-|   |-- views.py             -- UI router (34 endpoints, data-driven dispatch,
+|   |-- api.py               -- Worker API router (20 endpoints)
+|   |-- views.py             -- UI router (33 routes, data-driven dispatch,
 |   |                          routing hub)
 |   |-- views_helpers.py     -- Pure stateless helpers extracted from views.py
 |   |-- views_actions.py     -- Actions-page helpers (row building, sorting, query strings)
@@ -33,7 +33,7 @@ server/
 |   |-- workerdb.py          -- WorkerDb: worker blocking
 |   |-- kvstore.py           -- KVStore: key-value metadata (legacy usernames, flags)
 |   |-- scheduler.py         -- Periodic task scheduler (primary instance only)
-|   |-- schemas.py           -- vtjson validation schemas (18 schemas)
+|   |-- schemas.py           -- vtjson validation schemas
 |   |-- run_cache.py         -- In-memory run cache with dirty-page flush
 |   |-- lru_cache.py         -- Generic LRU cache
 |   |-- spsa_handler.py      -- SPSA tuning parameter handler
@@ -41,17 +41,18 @@ server/
 |   |-- util.py              -- Shared utilities (formatting, validation helpers)
 |   |-- __init__.py          -- Minimal package init
 |   |-- http/                -- HTTP support modules
-|   |-- templates/           -- Jinja2 templates (49 files, .html.j2)
+|   |-- templates/           -- Jinja2 templates (53 files, .html.j2)
 |   |-- static/              -- Static assets (JS, CSS, images)
 |   `-- stats/               -- Statistical computation modules
-`-- tests/                   -- Test suite (21 test modules; dedicated view
-                               and HTTP contract tests)
+`-- tests/                   -- Focused unit and HTTP contract tests
 ```
 
 `views.py` remains the stable UI routing hub. The extracted `views_*.py` modules
 hold domain logic, but route registration, `_dispatch_view`, and the request
 shim stay centralized there. Each extracted `views_*.py` module keeps a matching
-dedicated test file under `server/tests/`.
+dedicated test file under `server/tests/`. User-facing route-family UI tests
+reuse `ui_user_test_case.py` and stay grouped by route family or one focused
+UI motif.
 
 ### HTTP support modules (`server/fishtest/http/`)
 
@@ -196,6 +197,17 @@ detect the `HX-Request: true` header (with a `Sec-Fetch-Mode` guard against
 full-page navigations), then returns the appropriate template via the
 `_render_hx_fragment()` helper. `_dispatch_view()` appends `Vary: HX-Request`
 to every GET response so that HTTP caches distinguish the two representations.
+UI GET responses also emit `Cache-Control`: the default is
+`no-cache, private`, auth-sensitive pages use `no-store`, and explicit
+route-level overrides such as `/tests/machines` can still set a short
+`max-age`. This keeps dynamic cache policy server-authoritative and prevents
+shared caches such as nginx `proxy_cache` from storing personalized UI
+responses.
+
+**Reverse-proxy cache boundary.** nginx should respect those application
+headers for dynamic content and should not add `proxy_cache` in front of UI
+routes. Aggressive proxy/browser caching remains appropriate for immutable
+static assets only.
 
 **Server-authoritative table state.** Newer htmx list pages (`/nns`,
 `/contributors`, `/user_management`, `/workers/show`, `/tests/machines`) keep
@@ -225,6 +237,18 @@ the polling lifecycle:
 - **200** -- swap the response content.
 - **204** -- no content; htmx skips the swap but continues polling.
 - **286** -- swap the response and stop polling (terminal state).
+
+The test detail page uses one visibility-aware OOB poller for live summary and
+detail data:
+
+- `/tests/view/{id}/detail` refreshes the ELO block, run status, active-worker
+   totals, detail table, time block, compact chi-square block, and the
+   embedded SPSA chart payload.
+
+The merged detail poller uses `hx-swap="none"`, so the poller element stays
+stable while htmx still applies the response's out-of-band section updates.
+The tasks table keeps its own conditional `/tests/tasks/{id}` poller because it
+has a separate shell/body + OOB-controls contract.
 
 **Visibility-aware polling policy.** Every periodic htmx poller follows a
 three-part trigger policy:
@@ -287,8 +311,9 @@ A single `RunDb` instance is created per process at startup and stored on
 
 ## Validation
 
-vtjson is the sole validation layer. The `schemas.py` module defines 19 schemas
-that validate plain Python dicts. Schemas are used in:
+vtjson is the sole validation layer. The `schemas.py` module defines the
+repository's vtjson schemas for plain Python dict validation. Schemas are used
+in:
 
 - API endpoints (request body validation).
 - Domain adapters (run, user, action document validation before MongoDB writes).

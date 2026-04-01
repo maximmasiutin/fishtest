@@ -238,7 +238,9 @@ must use `{{ value|safe }}` or `{% autoescape false %}`.
 | Parameter filtering | https://htmx.org/attributes/hx-params/ |
 | Multiple triggers | https://htmx.org/attributes/hx-trigger/ |
 | Template fragments essay | https://htmx.org/essays/template-fragments/ |
+| Hypermedia Systems (book) | https://hypermedia.systems/ |
 | Web security with htmx | https://htmx.org/essays/web-security-basics-with-htmx/ |
+| `Vary` (MDN) | https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Vary |
 | Search inputs (MDN) | https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/input/search |
 | Search clear pseudo-element (MDN) | https://developer.mozilla.org/en-US/docs/Web/CSS/::-webkit-search-cancel-button |
 | Search event (MDN) | https://developer.mozilla.org/en-US/docs/Web/API/HTMLInputElement/search_event |
@@ -309,6 +311,9 @@ that HTTP caches (nginx, CDNs) store separate representations:
 _append_vary_header(response, "HX-Request")
 ```
 
+Use the same `Vary: HX-Request` value on the full-page response, the fragment
+response, and any `304 Not Modified` response for that URL.
+
 **OOB swaps with Jinja2**: out-of-band elements carry `hx-swap-oob`
 attributes directly in the template markup. Multiple elements can be updated
 in a single response. For table rows, `<template>` wrappers are required
@@ -343,6 +348,12 @@ so user-initiated sort/page changes beat the background poll.
 `hx-disinherit="hx-include"` and `hx-params="none"` so only the explicit URL
 state is sent.
 
+**Search portability**: `input changed delay:{{ htmx.input_changed_delay_ms }}ms`
+is the portable search trigger baseline. Native `search` events and
+`::-webkit-search-cancel-button` styling are browser-specific enhancements,
+not the correctness contract. Search inputs keep visible labels or another
+valid accessible name.
+
 **Conditional polling with visibility**: polls are gated on tab visibility
 to avoid unnecessary server load:
 
@@ -352,6 +363,8 @@ to avoid unnecessary server load:
      hx-swap="none">
 </div>
 ```
+
+Treat the transition to `hidden` as the point to stop background UI updates.
 
 **Focus-return immediate refresh**: every visibility-gated poller also
 triggers on `visibilitychange` so that returning to the tab produces an
@@ -384,13 +397,30 @@ must be constructed with DOM API (`createElement`, `textContent`,
 prevent XSS from error messages and to keep htmx attributes functional
 (via `htmx.process()`).
 
+## Python, MongoDB, and tooling
+
+### Canonical references
+
+| Topic | URL |
+|------|-----|
+| Python 3.14 docs | https://docs.python.org/3.14/ |
+| MongoDB manual | https://www.mongodb.com/docs/manual/ |
+| PyMongo | https://www.mongodb.com/docs/languages/python/pymongo-driver/current/ |
+| Ruff | https://docs.astral.sh/ruff/ |
+| ty | https://docs.astral.sh/ty/ |
+| mypy | https://mypy.readthedocs.io/en/stable/ |
+| nginx | https://nginx.org/en/docs/ |
+
+Use [7-development.md](7-development.md) for local lint and test workflows.
+
 ## Tooling references
 
-| Tool | Command / Path | Purpose |
-|------|----------------|---------|
-| Python project config | `server/pyproject.toml` | Tracked lint, dependency, and test-tool configuration |
-| Server test package | `server/tests/` | Tracked unit and HTTP contract tests |
-| Local test runner | `cd server && uv run python -m unittest discover -s tests -q` | Focused server-only test loop |
+| Tool | Path | Purpose |
+|------|------|---------|
+| Repository dev tools | `pyproject.toml` | Shared repo tooling configuration |
+| Server Python project | `server/pyproject.toml` | Server dependency and tool configuration |
+| Worker Python project | `worker/pyproject.toml` | Worker dependency configuration |
+| Server test package | `server/tests/` | Unit and HTTP contract tests |
 
 ## Testing patterns
 
@@ -398,17 +428,8 @@ prevent XSS from error messages and to keep htmx attributes functional
 
 Server tests live in `server/tests/`. All tests use `unittest.TestCase`.
 MongoDB is required for most tests (the CI workflow starts `mongod` before
-running the suite).
-
-### Running tests
-
-From the repo root:
-
-```bash
-# Manual local run
-mongod --dbpath /tmp/fishtest-test-db --port 27017 &
-cd server && uv run python -m unittest discover -s tests -q
-```
+running the suite). User-facing HTTP route tests are split by route family or
+one focused UI motif instead of accumulating in one omnibus module.
 
 ### Fixtures
 
@@ -422,6 +443,9 @@ Most test files import `test_support`, which provides:
 - `find_run(...)`: retrieves a run from the database by field match.
 - `extract_csrf_token(html)`: parses a CSRF token from rendered HTML.
 
+User-facing UI route modules also reuse `ui_user_test_case.py` for shared
+client setup, login helpers, run creation, and DB cleanup.
+
 Worker-related fixtures must match the `short_worker_name` pattern
 (`.*-[\d]+cores-[a-zA-Z0-9]{2,8}`) or `WorkerDb.update_worker()` schema
 validation fails.
@@ -432,12 +456,16 @@ validation fails.
 |--------|----------|
 | `test_app.py` | Application startup, middleware, lifespan |
 | `test_api.py` | Worker API protocol (request_task, update_task, beat) |
-| `test_users.py` | Login, CSRF, permissions, UI form submission |
+| `test_users.py` | Login, signup, remember-me, userdb auth flags, basic UI smoke |
+| `test_views_admin.py` | Workers, user-management, rate-limits, and shared admin UI contracts |
+| `test_views_tests.py` | `/tests` and `/tests/user/{username}` filter state and live-table polling |
 | `test_views_actions.py` | Actions search, pagination, sorting |
+| `test_views_contributors.py` | Contributors search, rank jump, sorting, and HTMX state sync |
+| `test_views_detail.py` | `/tests/view/{id}` detail polling, `/tests/tasks/{id}`, and task UI assets |
 | `test_views_finished.py` | Finished-runs search and pagination |
 | `test_views_helpers.py` | Shared pagination, parameter, and merge helpers |
-| `test_views_machines.py` | Machines filter state, normalization, cookies |
-| `test_views_run.py` | Run-form validation, SPSA parsing, permissions |
+| `test_views_machines.py` | Machines helper behavior plus `/tests/machines` HTTP contracts |
+| `test_views_run.py` | Run-form validation, SPSA parsing, permissions, and run action routes |
 | `test_http_boundary.py` | HTTP boundary invariants and template contracts |
 | `test_http_dependencies.py` | Request-state dependency wiring |
 | `test_http_errors.py` | API vs UI error shaping |

@@ -26,7 +26,7 @@ Config keys:
 | `renderer` | string | Jinja2 template name (e.g., `"tests.html.j2"`) |
 | `require_csrf` | bool | Enforce CSRF validation on POST |
 | `require_primary` | bool | Reject POST on non-primary instance (503) |
-| `request_method` | string or tuple | Allowed HTTP methods (default: GET + POST) |
+| `request_method` | string or tuple | Allowed HTTP methods (default: GET) |
 | `http_cache` | int | `Cache-Control: max-age=` seconds |
 | `direct` | bool | Bypass `_dispatch_view` (for pure redirects) |
 
@@ -34,43 +34,49 @@ At module load time, `_register_view_routes()` iterates over `_VIEW_ROUTES`,
 wraps each handler with `_dispatch_view()` (unless `direct=True`), and
 registers it on the FastAPI router.
 
+When `request_method` is omitted, the route is read-only and registered as
+`GET` only. The small set of endpoints that render a form on `GET` and process
+it on `POST` opt into `GET, POST` explicitly, while pure mutations stay
+`POST` only. `HEAD` works on `GET` routes through middleware compatibility,
+but generic `OPTIONS` is not part of the UI route contract and returns `405`.
+
 ## Registered routes
 
 | Path | Method(s) | Handler | Template | Notes |
 |------|-----------|---------|----------|-------|
-| `/` | GET, POST | `home` | -- | Redirects to `/tests` (direct) |
+| `/` | GET | `home` | -- | Redirects to `/tests` (direct) |
 | `/login` | GET, POST | `login` | `login.html.j2` | CSRF |
 | `/logout` | POST | `logout` | -- | CSRF |
 | `/signup` | GET, POST | `signup` | `signup.html.j2` | CSRF |
-| `/tests` | GET, POST | `tests` | `tests.html.j2` | Main dashboard |
+| `/tests` | GET | `tests` | `tests.html.j2` | Main dashboard; page 1 live run tables poll the same route via `?live=run_tables` |
 | `/tests/run` | GET, POST | `tests_run` | `tests_run.html.j2` | CSRF, primary |
 | `/tests/modify` | POST | `tests_modify` | -- | CSRF, primary |
 | `/tests/stop` | POST | `tests_stop` | -- | CSRF, primary |
 | `/tests/approve` | POST | `tests_approve` | -- | CSRF, primary |
 | `/tests/purge` | POST | `tests_purge` | -- | CSRF, primary |
 | `/tests/delete` | POST | `tests_delete` | -- | CSRF, primary |
-| `/tests/view/{id}` | GET, POST | `tests_view` | `tests_view.html.j2` | |
-| `/tests/live_elo/{id}` | GET, POST | `tests_live_elo` | `tests_live_elo.html.j2` | Live Elo page + dual-scale gauge |
-| `/tests/stats/{id}` | GET, POST | `tests_stats` | `tests_stats.html.j2` | HX: `tests_stats_content_fragment.html.j2`; active runs poll with the dedicated stats-page interval and visibility-aware refresh |
-| `/tests/tasks/{id}` | GET, POST | `tests_tasks` | `tasks_content_fragment.html.j2` | Fragment-only; updates the scrolling task table body and refreshes fixed controls/pagination OOB, with server-side sorting for every visible task column, one combined worker/info search filter, and 25-row pagination |
-| `/tests/machines` | GET, POST | `tests_machines` | `machines_fragment.html.j2` | Fragment-only, 10s cache |
-| `/tests/elo/{id}` | GET, POST | `tests_elo` | `elo_results_fragment.html.j2` | Fragment-only (OOB) |
-| `/tests/elo_batch` | GET, POST | `tests_elo_batch` | `elo_batch_fragment.html.j2` | Fragment-only (OOB batch) |
-| `/tests/live_elo_update/{id}` | GET, POST | `live_elo_update` | `live_elo_fragment.html.j2` | Fragment-only (OOB) |
-| `/tests/finished` | GET, POST | `tests_finished` | `tests_finished.html.j2` | HX: `tests_finished_content_fragment` |
-| `/tests/user/{username}` | GET, POST | `tests_user` | `tests_user.html.j2` | HX: `tests_user_content_fragment` |
-| `/actions` | GET, POST | `actions` | `actions.html.j2` | HX: `actions_content_fragment` |
-| `/contributors` | GET, POST | `contributors` | `contributors.html.j2` | HX: `contributors_content_fragment`; paginated (100/page) |
-| `/contributors/monthly` | GET, POST | `contributors_monthly` | `contributors.html.j2` | HX: `contributors_content_fragment`; paginated (100/page) |
-| `/user/{username}` | GET, POST | `user` | `user.html.j2` | |
-| `/user` | GET, POST | `user` | `user.html.j2` | |
-| `/user_management` | GET, POST | `user_management` | `user_management.html.j2` | HX: `user_management_content_fragment` |
+| `/tests/view/{id}` | GET | `tests_view` | `tests_view.html.j2` | Full detail page; unfinished runs poll the merged detail fragment endpoint and the dedicated tasks endpoint |
+| `/tests/view/{id}/detail` | GET | `tests_view_detail` | `tests_view_detail_fragment.html.j2` | Fragment-only; OOB refresh for ELO, run status, active-worker totals, detail, time, chi-square, and the retained SPSA data payload |
+| `/tests/live_elo/{id}` | GET | `tests_live_elo` | `tests_live_elo.html.j2` | Live Elo page + dual-scale gauge |
+| `/tests/stats/{id}` | GET | `tests_stats` | `tests_stats.html.j2` | HX: `tests_stats_content_fragment.html.j2`; active runs poll with the dedicated stats-page interval and visibility-aware refresh |
+| `/tests/tasks/{id}` | GET | `tests_tasks` | `tasks_content_fragment.html.j2` | Fragment-only; updates the scrolling task table body and refreshes fixed controls/pagination OOB, with server-side sorting for every visible task column, one combined worker/info search filter, and 25-row pagination |
+| `/tests/machines` | GET | `tests_machines` | `machines_fragment.html.j2` | Fragment-only, 10s cache |
+| `/tests/live_elo_update/{id}` | GET | `live_elo_update` | `live_elo_fragment.html.j2` | Fragment-only (OOB) |
+| `/tests/finished` | GET | `tests_finished` | `tests_finished.html.j2` | HX: `tests_finished_content_fragment` |
+| `/tests/user/{username}` | GET | `tests_user` | `tests_user.html.j2` | HX: `tests_user_content_fragment`; page 1 live run tables poll the same route via `?live=run_tables` |
+| `/actions` | GET | `actions` | `actions.html.j2` | HX: `actions_content_fragment` |
+| `/contributors` | GET | `contributors` | `contributors.html.j2` | HX: `contributors_content_fragment`; paginated (100/page) |
+| `/contributors/monthly` | GET | `contributors_monthly` | `contributors.html.j2` | HX: `contributors_content_fragment`; paginated (100/page) |
+| `/user/{username}` | GET, POST | `user` | `user.html.j2` | CSRF |
+| `/user` | GET, POST | `user` | `user.html.j2` | CSRF |
+| `/user_management` | GET | `user_management` | `user_management.html.j2` | HX: `user_management_content_fragment` |
+| `/user_management/pending_count` | GET | `user_management_pending_count` | `pending_users_nav_fragment.html.j2` | Fragment-only sidebar poll |
 | `/workers/{worker_name}` | GET, POST | `workers` | `workers.html.j2` | CSRF; HX: `workers_content_fragment` |
 | `/upload` | GET, POST | `upload` | `nn_upload.html.j2` | CSRF |
-| `/nns` | GET, POST | `nns` | `nns.html.j2` | HX: `nns_content_fragment` |
-| `/sprt_calc` | GET, POST | `sprt_calc` | `sprt_calc.html.j2` | |
-| `/rate_limits` | GET, POST | `rate_limits` | `rate_limits.html.j2` | |
-| `/rate_limits/server` | GET, POST | `rate_limits_server` | inline HTML response | Fragment-only |
+| `/nns` | GET | `nns` | `nns.html.j2` | HX: `nns_content_fragment` |
+| `/sprt_calc` | GET | `sprt_calc` | `sprt_calc.html.j2` | |
+| `/rate_limits` | GET | `rate_limits` | `rate_limits.html.j2` | |
+| `/rate_limits/server` | GET | `rate_limits_server` | inline HTML response | Fragment-only |
 
 ## Sidebar status links
 
@@ -92,21 +98,46 @@ Route notes:
   is present, otherwise renders the full-page template.
 - **OOB**: fragment contains `hx-swap-oob` attributes for multi-element updates.
 
-## `/tests/elo/{id}` expected-state contract
+## `/tests/view/{id}/detail` live detail contract
 
-The detail-page ELO poller sends an optional `expected` query parameter that
-captures the state the page already shows (`active`, `paused`, or `pending`). The handler
-compares that value to the current run state before responding:
+The test detail page keeps its live summary and detail data synchronized
+through the fragment-only `/tests/view/{id}/detail` endpoint. This endpoint
+is the live detail-page poll contract.
 
-- `204` when the current state still matches `expected`.
-- `200` when the state changed and the page needs fresh OOB content.
-- `286` when the run is terminal (`finished` or `failed`).
+The full detail page uses a visibility-aware htmx poller with:
 
-Without `expected`, the handler follows the older fragment-only contract:
+- `hx-get="/tests/view/{id}/detail"`
+- `hx-include="#tests-view-detail-expected"`
+- `hx-swap="none"`
 
-- `200` for active runs.
-- `204` for paused or pending non-terminal runs.
-- `286` for terminal runs.
+The response updates these regions out of band:
+
+- `#elo-<run_id>`
+- `#run-status-<run_id>`
+- `#tasks-totals`
+- `#tests-view-details`
+- `#tests-view-time`
+- `#tests-view-stats` for non-SPSA runs
+- `#spsa-data-<run_id>` for SPSA runs
+
+For SPSA runs, the detail fragment updates the existing
+`#spsa-data-<run_id>` node in place. The page-owned `spsa.js` controller keeps
+the chart shell mounted, draws the chart at a fixed 1000x500 size inside the
+scrollable container, skips redraws when the embedded JSON payload is unchanged,
+and redraws changed payloads in place without replacing the chart shell.
+
+The request submits the page's current canonical `expected` state from a
+server-owned hidden input:
+
+- `active`
+- `paused`
+- `pending`
+
+Server behavior for htmx polling:
+
+- `200` returns fresh OOB detail content.
+- `204` keeps the current DOM when the run is still paused or pending.
+- `286` returns the final fragment and stops polling when the run is terminal.
 
 ## `/tests/live_elo/{id}` gauge scale contract
 
@@ -138,7 +169,7 @@ The raw statistics page is dual-mode:
 
 The page shell keeps a visibility-aware poller for unfinished non-SPSA runs:
 
-- `every {{ poll.stats_detail }}s [document.visibilityState === 'visible']`
+- `every {{ poll.tests_stats }}s [document.visibilityState === 'visible']`
 - `visibilitychange[document.visibilityState === 'visible'] from:document`
 
 Server behavior for htmx polling:
@@ -432,14 +463,15 @@ Behavior notes:
    `q`, and `my_workers` values in cookies, so returning to `/tests` restores
    the last machines filter state.
 - Workers counter semantics are stable across `/tests`, `/tests/machines`, and
-   `/tests/elo_batch` OOB updates:
+   the page-1 `/tests?live=run_tables` OOB updates:
   - no active filters: `Workers - <total>`
   - active `q` and/or `my_workers`: `Workers - <total> (<filtered>)`
 - When workers filters are active and the Workers panel is collapsed, `/tests`
-   and `/tests/elo_batch` recompute the filtered value from the current machine
-   snapshot instead of reusing the last cookie-backed filtered count.
-- Machines sorting is fully server-authoritative; the old generic client-side
-   header sorter has been retired.
+   and its page-1 live run-table fragment recompute the filtered value from the
+   current machine snapshot instead of reusing the last cookie-backed filtered
+   count.
+- Machines sorting is fully server-authoritative; there is no client-side
+   header sorter.
 
 ## Active runs type filter
 
@@ -535,8 +567,8 @@ Behavior notes:
 - The outer GET form keeps `sort`, `order`, and `view` in hidden inputs.
   htmx fragment responses refresh those hidden inputs out of band so later
   group or filter changes preserve the current table state.
-- Table sorting is fully server-authoritative; the old generic client-side
-   header sorter has been retired.
+- Table sorting is fully server-authoritative; there is no client-side header
+   sorter.
 
 ## Workers management (`/workers/show`) query parameters
 
@@ -569,8 +601,8 @@ Behavior notes:
 - The outer GET form keeps `sort`, `order`, and `view` in hidden inputs.
   htmx fragment responses refresh those hidden inputs out of band so later
   filter changes preserve the current table state.
-- Table sorting is fully server-authoritative; the old generic client-side
-   header sorter has been retired.
+- Table sorting is fully server-authoritative; there is no client-side header
+   sorter.
 
 ## Contributors query parameters
 
@@ -598,8 +630,8 @@ Behavior notes:
    pagination/sort/view links, preventing repeated jumps during later browsing.
 - `/contributors` and `/contributors/monthly` stay on the userdb fast path:
    the all-time page reads from `userdb.user_cache`, and the monthly page reads
-   from `userdb.top_month`, so search and rank-jump never need an actions-log
-   scan.
+   from `userdb.top_month`, a rolling cache rebuilt from unfinished runs
+   (pending and active) plus finished runs started within the last 30 days.
 - Sort-header links are dual-mode (`href` + `hx-get`): contributors sorting
    swaps `#contributors-content` with `hx-push-url="true"` when htmx is active,
    and still works as normal navigation when JavaScript is unavailable.
@@ -642,8 +674,8 @@ Behavior notes:
   pagination, table, pagination.
 - `master_only` checkbox preference is persisted in a cookie and reused when
    the query parameter is not present.
-- Table sorting is fully server-authoritative; the old generic client-side
-   header sorter has been retired.
+- Table sorting is fully server-authoritative; there is no client-side header
+   sorter.
 
 ## Actions (`/actions`) query parameters
 
