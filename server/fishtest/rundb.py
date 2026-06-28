@@ -1329,11 +1329,10 @@ class RunDb:
         base_tp = run["args"]["throughput"]
         itp = base_tp = max(min(base_tp, 500), 1)  # Sanity check
 
-        # The primary adjustment is derived from a power law of test TC relative to STC, so that long TCs compromise
-        # between worse latency and chewing too many cores.
+        # The primary adjustment is derived from a power law of test TC relative to STC,
+        # so that long TCs compromise between worse latency and chewing too many cores.
         tc_ratio = get_tc_ratio(run["args"]["tc"], run["args"]["threads"])
-        # Discount longer test itp-per-TC without boosting sub-STC tests
-        if tc_ratio > 1:
+        if tc_ratio > 1:  # Don't boost VSTC tests
             # LTC/STC tc_ratio = 6, target latency ratio = 3/2,
             # --> LTC itp = 4 --> power = log(4)/log(6) ~ 0.774
             itp *= tc_ratio**0.774
@@ -1341,20 +1340,18 @@ class RunDb:
         # The second adjustment is a multiplicative malus for too many active runs
         itp *= 36.0 / (36.0 + count * count)
 
-        # Latency focus: +10% per 100k games (max +100%)
+        # Latency focus: max +100% bonus at 200k games
+        # (At current default bounds, 200k games is a typical neutral-elo duration)
         r = run["results"]
         n = r["wins"] + r["losses"] + r["draws"]
-        itp *= min(1.0 + (n / 100_000) * 0.1, 2.0)
+        add_bonus = min(n / 200_000, 1.0)
 
         # Small bonus for high LLR (more for strong-gainer bounds)
         if sprt := run["args"].get("sprt"):
-            llr = sprt.get("llr", 0.0)
-            if llr > 2.0:
-                itp *= 1.1
-                if sprt.get("elo0", 0.0) > 0.0:
-                    itp *= 1.1
+            if sprt.get("llr", 0.0) > 2.0:
+                add_bonus += 0.1 + 0.1 * (sprt.get("elo0", 0.0) > 0.0)
 
-        run["args"]["itp"] = itp
+        run["args"]["itp"] = itp * (1.0 + add_bonus)
 
     # Caps concurrent /api/request_task threadpool usage to
     # TASK_SEMAPHORE_SIZE (5) out of THREADPOOL_TOKENS (200).
